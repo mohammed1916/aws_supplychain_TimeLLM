@@ -18,7 +18,10 @@
     "@aws-sdk/client-s3": "^3.450.0",
     "@aws-sdk/client-sagemaker": "^3.450.0",
     "@aws-sdk/client-cloudwatch": "^3.450.0",
-    "@aws-sdk/client-lambda": "^3.450.0"
+    "@aws-sdk/client-lambda": "^3.450.0",
+    "@aws-sdk/client-dynamodb": "^3.450.0",
+    "@aws-sdk/lib-dynamodb": "^3.450.0",
+    "@aws-sdk/client-api-gateway": "^3.450.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",

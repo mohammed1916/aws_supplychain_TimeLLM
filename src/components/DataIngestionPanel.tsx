@@ -11,6 +11,10 @@ import {
   Zap
 } from 'lucide-react';
 
+import { useDataSources } from '../hooks/useApiData';
+import { LoadingSpinner } from './LoadingSpinner';
+import { DataStatus } from './DataStatus';
+
 interface DataSource {
   id: string;
   name: string;
@@ -26,7 +30,16 @@ interface DataIngestionPanelProps {
 }
 
 export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUpdate }) => {
-  const [dataSources, setDataSources] = useState<DataSource[]>([
+  const { 
+    data: apiDataSources, 
+    loading, 
+    error, 
+    lastUpdated, 
+    refresh 
+  } = useDataSources();
+
+  // Fallback static data
+  const defaultDataSources: DataSource[] = [
     {
       id: 'sales-data',
       name: 'Historical Sales Data',
@@ -63,7 +76,9 @@ export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUp
       recordsProcessed: 12456,
       dataQuality: 94.7
     }
-  ]);
+  ];
+
+  const dataSources = apiDataSources || defaultDataSources;
 
   const [processingStats, setProcessingStats] = useState({
     totalRecords: 3062260,
@@ -71,6 +86,23 @@ export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUp
     dataQualityAvg: 97.1,
     pipelineHealth: 98.3
   });
+
+  // Update processing stats based on data sources
+  useEffect(() => {
+    if (dataSources) {
+      const totalRecords = dataSources.reduce((sum, source) => sum + source.recordsProcessed, 0);
+      const avgQuality = dataSources.reduce((sum, source) => sum + source.dataQuality, 0) / dataSources.length;
+      const activeCount = dataSources.filter(source => source.status === 'active').length;
+      const pipelineHealth = (activeCount / dataSources.length) * 100;
+
+      setProcessingStats({
+        totalRecords,
+        processedToday: Math.floor(totalRecords * 0.05), // Assume 5% processed today
+        dataQualityAvg: Math.round(avgQuality * 10) / 10,
+        pipelineHealth: Math.round(pipelineHealth * 10) / 10
+      });
+    }
+  }, [dataSources]);
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -100,6 +132,15 @@ export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUp
 
   return (
     <div className="space-y-6">
+      {/* Data Status */}
+      <DataStatus
+        loading={loading}
+        error={error}
+        lastUpdated={lastUpdated}
+        onRefresh={refresh}
+        className="mb-4"
+      />
+
       {/* Processing Overview */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-white/70 backdrop-blur-sm rounded-xl p-4 border border-slate-200">
@@ -161,43 +202,49 @@ export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUp
           </button>
         </div>
 
-        <div className="space-y-4">
-          {dataSources.map((source) => (
-            <div key={source.id} className="flex items-center justify-between p-4 bg-white/50 rounded-xl border border-slate-100">
-              <div className="flex items-center space-x-4">
-                <div className={`px-3 py-1 rounded-full text-xs font-medium border ${getStatusColor(source.status)}`}>
-                  <div className="flex items-center space-x-1">
-                    {getStatusIcon(source.status)}
-                    <span>{source.status.toUpperCase()}</span>
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <LoadingSpinner text="Loading data sources..." />
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {dataSources.map((source) => (
+              <div key={source.id} className="flex items-center justify-between p-4 bg-white/50 rounded-xl border border-slate-100">
+                <div className="flex items-center space-x-4">
+                  <div className={`px-3 py-1 rounded-full text-xs font-medium border ${getStatusColor(source.status)}`}>
+                    <div className="flex items-center space-x-1">
+                      {getStatusIcon(source.status)}
+                      <span>{source.status.toUpperCase()}</span>
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <h4 className="font-medium text-slate-800">{source.name}</h4>
+                    <p className="text-sm text-slate-600">
+                      {source.type} • Last sync: {new Date(source.lastSync).toLocaleTimeString()}
+                    </p>
                   </div>
                 </div>
-                
-                <div>
-                  <h4 className="font-medium text-slate-800">{source.name}</h4>
-                  <p className="text-sm text-slate-600">
-                    {source.type} • Last sync: {new Date(source.lastSync).toLocaleTimeString()}
-                  </p>
-                </div>
-              </div>
 
-              <div className="flex items-center space-x-6 text-sm">
-                <div className="text-center">
-                  <p className="text-slate-600">Records</p>
-                  <p className="font-semibold text-slate-800">{source.recordsProcessed.toLocaleString()}</p>
+                <div className="flex items-center space-x-6 text-sm">
+                  <div className="text-center">
+                    <p className="text-slate-600">Records</p>
+                    <p className="font-semibold text-slate-800">{source.recordsProcessed.toLocaleString()}</p>
+                  </div>
+                  <div className="text-center">
+                    <p className="text-slate-600">Quality</p>
+                    <p className={`font-semibold ${source.dataQuality > 95 ? 'text-green-600' : source.dataQuality > 90 ? 'text-yellow-600' : 'text-red-600'}`}>
+                      {source.dataQuality}%
+                    </p>
+                  </div>
+                  <button className="px-3 py-1 text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors">
+                    Configure
+                  </button>
                 </div>
-                <div className="text-center">
-                  <p className="text-slate-600">Quality</p>
-                  <p className={`font-semibold ${source.dataQuality > 95 ? 'text-green-600' : source.dataQuality > 90 ? 'text-yellow-600' : 'text-red-600'}`}>
-                    {source.dataQuality}%
-                  </p>
-                </div>
-                <button className="px-3 py-1 text-blue-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors">
-                  Configure
-                </button>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* AWS Glue ETL Pipeline */}

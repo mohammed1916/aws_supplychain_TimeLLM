@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API Gateway for TimeWise Supply Chain platform'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  ForecastsLambdaArn:
+    Type: String
+    Description: 'ARN of the Forecasts Lambda function'
+  
+  AlertsLambdaArn:
+    Type: String
+    Description: 'ARN of the Alerts Lambda function'
+
+Resources:
+  # API Gateway REST API
+  TimeWiseAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'timewise-api-${Environment}'
+      Description: 'TimeWise Supply Chain API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: '*'
+
+  # API Gateway Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ForecastsMethod
+      - AlertsMethod
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      StageName: !Ref Environment
+
+  # Lambda Permissions for API Gateway
+  ForecastsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForecastsLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  AlertsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertsLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  # Forecasts Resource
+  ForecastsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'forecasts'
+
+  ForecastsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Headers: true
+
+  # Alerts Resource
+  AlertsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'alerts'
+
+  AlertsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Methods: true
+            Access-Control-Allow-Headers: true
+
+  # CORS Options Method for Forecasts
+  ForecastsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # CORS Options Method for Alerts
+  AlertsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+Outputs:
+  APIGatewayURL:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${TimeWiseAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayURL'
+
+  APIGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref TimeWiseAPI
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayId'
