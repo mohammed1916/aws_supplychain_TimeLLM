@@ -1,51 +1,46 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'API Gateway for TimeWise Supply Chain platform'
+Description: >-
+  API Gateway REST API for the TimeWise Supply Chain platform. Each top-level
+  resource plus a greedy {proxy+} child is routed via Lambda-proxy integration
+  to one of six domain services; method-level routing and CORS preflight are
+  handled inside the Lambda router.
 
 Parameters:
   Environment:
     Type: String
     Default: 'prod'
     AllowedValues: ['dev', 'staging', 'prod']
-    Description: 'Environment name'
-  
   ForecastsLambdaArn:
     Type: String
-    Description: 'ARN of the Forecasts Lambda function'
-  
+    Description: 'Forecasts service (also serves /sagemaker/inference)'
   AlertsLambdaArn:
     Type: String
-    Description: 'ARN of the Alerts Lambda function'
+    Description: 'Alerts service (also serves /inventory-alerts)'
+  DataPlatformLambdaArn:
+    Type: String
+    Description: 'Data-platform service (/kpis, /metrics, /data-sources)'
+  OptimizationLambdaArn:
+    Type: String
+    Description: 'Optimization service (/optimization-scenarios, /inventory-optimizations)'
+  AnalyticsLambdaArn:
+    Type: String
+    Description: 'Analytics service (/reports, /analytics-insights)'
+  GovernanceLambdaArn:
+    Type: String
+    Description: 'Governance service (/access-controls, /governance-metrics, /bias-detections)'
 
 Resources:
-  # API Gateway REST API
   TimeWiseAPI:
     Type: AWS::ApiGateway::RestApi
     Properties:
       Name: !Sub 'timewise-api-${Environment}'
       Description: 'TimeWise Supply Chain API'
       EndpointConfiguration:
-        Types:
-          - REGIONAL
-      Policy:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: '*'
-            Action: 'execute-api:Invoke'
-            Resource: '*'
+        Types: [REGIONAL]
 
-  # API Gateway Deployment
-  APIDeployment:
-    Type: AWS::ApiGateway::Deployment
-    DependsOn:
-      - ForecastsMethod
-      - AlertsMethod
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      StageName: !Ref Environment
+  # --- Lambda invoke permissions (one per service) -----------------------------
 
-  # Lambda Permissions for API Gateway
-  ForecastsLambdaPermission:
+  ForecastsInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ForecastsLambdaArn
@@ -53,7 +48,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
 
-  AlertsLambdaPermission:
+  AlertsInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref AlertsLambdaArn
@@ -61,13 +56,53 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
 
-  # Forecasts Resource
+  DataPlatformInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataPlatformLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  OptimizationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OptimizationLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  AnalyticsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyticsLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  GovernanceInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GovernanceLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
+
+  # --- /forecasts (forecasts service) ------------------------------------------
+
   ForecastsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'forecasts'
+
+  ForecastsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref ForecastsResource
+      PathPart: '{proxy+}'
 
   ForecastsMethod:
     Type: AWS::ApiGateway::Method
@@ -80,20 +115,62 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
-      MethodResponses:
-        - StatusCode: 200
-          ResponseHeaders:
-            Access-Control-Allow-Origin: true
-            Access-Control-Allow-Methods: true
-            Access-Control-Allow-Headers: true
 
-  # Alerts Resource
+  ForecastsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
+
+  # --- /sagemaker (forecasts service) --------------------------------------------
+
+  SageMakerResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'sagemaker'
+
+  SageMakerProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref SageMakerResource
+      PathPart: '{proxy+}'
+
+  SageMakerProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref SageMakerProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
+
+  # --- /alerts (alerts service) ----------------------------------------------------
+
   AlertsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'alerts'
+
+  AlertsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref AlertsResource
+      PathPart: '{proxy+}'
 
   AlertsMethod:
     Type: AWS::ApiGateway::Method
@@ -106,70 +183,416 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
-      MethodResponses:
-        - StatusCode: 200
-          ResponseHeaders:
-            Access-Control-Allow-Origin: true
-            Access-Control-Allow-Methods: true
-            Access-Control-Allow-Headers: true
 
-  # CORS Options Method for Forecasts
-  ForecastsOptionsMethod:
+  AlertsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref ForecastsResource
-      HttpMethod: OPTIONS
+      ResourceId: !Ref AlertsProxyResource
+      HttpMethod: ANY
       AuthorizationType: NONE
       Integration:
-        Type: MOCK
-        IntegrationResponses:
-          - StatusCode: 200
-            ResponseParameters:
-              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
-              method.response.header.Access-Control-Allow-Origin: "'*'"
-        RequestTemplates:
-          application/json: '{"statusCode": 200}'
-      MethodResponses:
-        - StatusCode: 200
-          ResponseParameters:
-            method.response.header.Access-Control-Allow-Headers: true
-            method.response.header.Access-Control-Allow-Methods: true
-            method.response.header.Access-Control-Allow-Origin: true
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
 
-  # CORS Options Method for Alerts
-  AlertsOptionsMethod:
+  # --- /inventory-alerts (alerts service) ---------------------------------------------
+
+  InventoryAlertsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'inventory-alerts'
+
+  InventoryAlertsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref InventoryAlertsResource
+      PathPart: '{proxy+}'
+
+  InventoryAlertsMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref AlertsResource
-      HttpMethod: OPTIONS
+      ResourceId: !Ref InventoryAlertsResource
+      HttpMethod: ANY
       AuthorizationType: NONE
       Integration:
-        Type: MOCK
-        IntegrationResponses:
-          - StatusCode: 200
-            ResponseParameters:
-              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
-              method.response.header.Access-Control-Allow-Origin: "'*'"
-        RequestTemplates:
-          application/json: '{"statusCode": 200}'
-      MethodResponses:
-        - StatusCode: 200
-          ResponseParameters:
-            method.response.header.Access-Control-Allow-Headers: true
-            method.response.header.Access-Control-Allow-Methods: true
-            method.response.header.Access-Control-Allow-Origin: true
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
+
+  InventoryAlertsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryAlertsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
+
+  # --- /kpis (data-platform service) -----------------------------------------------------
+
+  KpisResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'kpis'
+
+  KpisMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref KpisResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
+
+  # --- /metrics (data-platform service) ---------------------------------------------------
+
+  MetricsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'metrics'
+
+  MetricsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref MetricsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
+
+  # --- /data-sources (data-platform service) -----------------------------------------------
+
+  DataSourcesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'data-sources'
+
+  DataSourcesProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref DataSourcesResource
+      PathPart: '{proxy+}'
+
+  DataSourcesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref DataSourcesResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
+
+  DataSourcesProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref DataSourcesProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
+
+  # --- /optimization-scenarios (optimization service) ----------------------------------------
+
+  OptimizationScenariosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'optimization-scenarios'
+
+  OptimizationScenariosProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref OptimizationScenariosResource
+      PathPart: '{proxy+}'
+
+  OptimizationScenariosMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref OptimizationScenariosResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  OptimizationScenariosProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref OptimizationScenariosProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  # --- /inventory-optimizations (optimization service) ---------------------------------------
+
+  InventoryOptimizationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'inventory-optimizations'
+
+  InventoryOptimizationsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref InventoryOptimizationsResource
+      PathPart: '{proxy+}'
+
+  InventoryOptimizationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryOptimizationsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  InventoryOptimizationsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryOptimizationsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  # --- /reports (analytics service) -----------------------------------------------------------
+
+  ReportsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'reports'
+
+  ReportsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref ReportsResource
+      PathPart: '{proxy+}'
+
+  ReportsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ReportsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
+
+  ReportsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ReportsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
+
+  # --- /analytics-insights (analytics service) -------------------------------------------------
+
+  AnalyticsInsightsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'analytics-insights'
+
+  AnalyticsInsightsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AnalyticsInsightsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
+
+  # --- /access-controls (governance service) ---------------------------------------------------
+
+  AccessControlsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'access-controls'
+
+  AccessControlsProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !Ref AccessControlsResource
+      PathPart: '{proxy+}'
+
+  AccessControlsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AccessControlsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  AccessControlsProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AccessControlsProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  # --- /governance-metrics (governance service) -------------------------------------------------
+
+  GovernanceMetricsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'governance-metrics'
+
+  GovernanceMetricsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref GovernanceMetricsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  # --- /bias-detections (governance service) -----------------------------------------------------
+
+  BiasDetectionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ParentId: !GetAtt TimeWiseAPI.RootResourceId
+      PathPart: 'bias-detections'
+
+  BiasDetectionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref BiasDetectionsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  # --- Deployment & stage --------------------------------------------------------
+
+  # Note: rename the logical ID (e.g. APIDeployment2) to force a new deployment
+  # when only method/integration configuration changes.
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ForecastsMethod
+      - ForecastsProxyMethod
+      - SageMakerProxyMethod
+      - AlertsMethod
+      - AlertsProxyMethod
+      - InventoryAlertsMethod
+      - InventoryAlertsProxyMethod
+      - KpisMethod
+      - MetricsMethod
+      - DataSourcesMethod
+      - DataSourcesProxyMethod
+      - OptimizationScenariosMethod
+      - OptimizationScenariosProxyMethod
+      - InventoryOptimizationsMethod
+      - InventoryOptimizationsProxyMethod
+      - ReportsMethod
+      - ReportsProxyMethod
+      - AnalyticsInsightsMethod
+      - AccessControlsMethod
+      - AccessControlsProxyMethod
+      - GovernanceMetricsMethod
+      - BiasDetectionsMethod
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
 
 Outputs:
   APIGatewayURL:
-    Description: 'API Gateway endpoint URL'
+    Description: 'API Gateway endpoint URL (set as VITE_API_GATEWAY_URL)'
     Value: !Sub 'https://${TimeWiseAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
     Export:
       Name: !Sub '${AWS::StackName}-APIGatewayURL'
-
   APIGatewayId:
     Description: 'API Gateway ID'
     Value: !Ref TimeWiseAPI

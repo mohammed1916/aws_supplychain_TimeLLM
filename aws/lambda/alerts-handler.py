@@ -1,251 +1,264 @@
+"""Alerts service.
+
+Dual-trigger handler:
+  1. API Gateway (Lambda proxy) for the /alerts and /inventory-alerts resources.
+  2. EventBridge "CloudWatch Alarm State Change" events, which are converted
+     into alert records and, when critical, published to SNS.
+
+Routes:
+    GET  /alerts                            list alerts (Query on
+                                            CategoryTimeIndex when ?category=)
+    POST /alerts                            create an alert
+    POST /alerts/{id}/acknowledge           acknowledge an alert
+    GET  /inventory-alerts                  list inventory alerts (Query on
+                                            ProductSeverityIndex when ?productId=)
+    POST /inventory-alerts/{id}/acknowledge acknowledge an inventory alert
+
+Environment:
+    ALERTS_TABLE, INVENTORY_ALERTS_TABLE   DynamoDB table names
+    SNS_TOPIC_ARN                          critical-alert topic; optional —
+                                           publishing is skipped with a warning
+                                           when unset
+    METRICS_NAMESPACE                      CloudWatch namespace prefix
+"""
+
 import json
-import boto3
 import logging
-from decimal import Decimal
-from datetime import datetime, timedelta
-from typing import Dict, List, Any
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict
 
-# Configure logging
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
+from common import (
+    NotFoundError,
+    Router,
+    ValidationError,
+    decode_page_token,
+    json_response,
+    list_response_body,
+    parse_body,
+    put_metric,
+    require_env,
+    require_fields,
+)
+
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
-# Initialize AWS clients
-dynamodb = boto3.resource('dynamodb')
-cloudwatch = boto3.client('cloudwatch')
-sns = boto3.client('sns')
+dynamodb = boto3.resource("dynamodb")
+cloudwatch = boto3.client("cloudwatch")
+sns = boto3.client("sns")
 
-# DynamoDB tables
-ALERTS_TABLE = dynamodb.Table('timewise-alerts')
-INVENTORY_TABLE = dynamodb.Table('timewise-inventory-alerts')
+ALERTS_TABLE = dynamodb.Table(require_env("ALERTS_TABLE"))
+INVENTORY_ALERTS_TABLE = dynamodb.Table(require_env("INVENTORY_ALERTS_TABLE"))
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+NAMESPACE = os.environ.get("METRICS_NAMESPACE", "TimeWise")
 
-def lambda_handler(event, context):
-    """
-    Lambda function to handle alerts and monitoring data
-    """
-    try:
-        # Check if this is a CloudWatch alarm trigger
-        if 'source' in event and event['source'] == 'aws.cloudwatch':
-            return handle_cloudwatch_alarm(event)
-        
-        # Handle HTTP API requests
-        http_method = event.get('httpMethod', 'GET')
-        path_parameters = event.get('pathParameters') or {}
-        
-        if http_method == 'GET':
-            return get_alerts()
-        elif http_method == 'POST':
-            alert_id = path_parameters.get('id')
-            action = path_parameters.get('action')
-            if action == 'acknowledge':
-                return acknowledge_alert(alert_id)
-            else:
-                body = json.loads(event.get('body', '{}'))
-                return create_alert(body)
-        else:
-            return {
-                'statusCode': 405,
-                'headers': get_cors_headers(),
-                'body': json.dumps({'error': 'Method not allowed'})
-            }
-            
-    except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
-        return {
-            'statusCode': 500,
-            'headers': get_cors_headers(),
-            'body': json.dumps({'error': 'Internal server error'})
+VALID_TYPES = ("info", "warning", "critical")
+CATEGORY_KEYWORDS = {
+    "inventory": ("inventory", "stock"),
+    "demand": ("demand", "forecast"),
+    "supply": ("supply", "supplier"),
+    "security": ("security", "access"),
+}
+
+router = Router()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --- Alerts -----------------------------------------------------------------
+
+
+@router.route("GET", "/alerts")
+def get_alerts(event: Dict[str, Any]) -> Dict[str, Any]:
+    params = event.get("queryStringParameters") or {}
+    start_key = decode_page_token(params.get("nextToken"))
+    category = params.get("category")
+
+    if category:
+        kwargs: Dict[str, Any] = {
+            "IndexName": "CategoryTimeIndex",
+            "KeyConditionExpression": Key("category").eq(category),
+            "ScanIndexForward": False,  # newest first
         }
-
-def handle_cloudwatch_alarm(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle CloudWatch alarm notifications"""
-    try:
-        detail = event.get('detail', {})
-        alarm_name = detail.get('alarmName', '')
-        state = detail.get('state', {}).get('value', '')
-        
-        if state == 'ALARM':
-            # Create alert based on CloudWatch alarm
-            alert_data = {
-                'type': 'critical' if 'critical' in alarm_name.lower() else 'warning',
-                'category': determine_category(alarm_name),
-                'title': f"CloudWatch Alarm: {alarm_name}",
-                'message': detail.get('state', {}).get('reason', 'Alarm triggered'),
-                'source': 'AWS CloudWatch',
-                'metadata': {
-                    'alarmName': alarm_name,
-                    'metricName': detail.get('metricName', ''),
-                    'threshold': detail.get('threshold', 0)
-                }
-            }
-            
-            create_alert(alert_data)
-            
-            # Send SNS notification for critical alerts
-            if alert_data['type'] == 'critical':
-                send_sns_notification(alert_data)
-        
-        return {'statusCode': 200}
-        
-    except Exception as e:
-        logger.error(f"Error handling CloudWatch alarm: {str(e)}")
-        raise
-
-def get_alerts() -> Dict[str, Any]:
-    """Get all alerts from DynamoDB"""
-    try:
-        response = ALERTS_TABLE.scan()
-        alerts = response.get('Items', [])
-        
-        # Sort by timestamp (most recent first)
-        alerts.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        
-        # Convert Decimal to float
-        alerts = convert_decimals(alerts)
-        
-        return {
-            'statusCode': 200,
-            'headers': get_cors_headers(),
-            'body': json.dumps({
-                'alerts': alerts,
-                'count': len(alerts),
-                'unacknowledged': len([a for a in alerts if not a.get('acknowledged', False)])
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting alerts: {str(e)}")
-        raise
-
-def create_alert(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create new alert in DynamoDB"""
-    try:
-        alert_item = {
-            'alertId': f"alert_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}",
-            'type': data.get('type', 'info'),
-            'category': data.get('category', 'system'),
-            'title': data.get('title', 'Alert'),
-            'message': data.get('message', ''),
-            'timestamp': datetime.utcnow().isoformat(),
-            'source': data.get('source', 'System'),
-            'acknowledged': False,
-            'actionRequired': data.get('actionRequired', False),
-            'metadata': data.get('metadata', {})
-        }
-        
-        ALERTS_TABLE.put_item(Item=alert_item)
-        
-        # Log metrics
-        cloudwatch.put_metric_data(
-            Namespace='TimeWise/Alerts',
-            MetricData=[
-                {
-                    'MetricName': 'AlertsCreated',
-                    'Value': 1,
-                    'Unit': 'Count',
-                    'Dimensions': [
-                        {
-                            'Name': 'AlertType',
-                            'Value': alert_item['type']
-                        },
-                        {
-                            'Name': 'Category',
-                            'Value': alert_item['category']
-                        }
-                    ]
-                }
-            ]
-        )
-        
-        return {
-            'statusCode': 201,
-            'headers': get_cors_headers(),
-            'body': json.dumps({
-                'alert': convert_decimals(alert_item),
-                'message': 'Alert created successfully'
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"Error creating alert: {str(e)}")
-        raise
-
-def acknowledge_alert(alert_id: str) -> Dict[str, Any]:
-    """Acknowledge an alert"""
-    try:
-        response = ALERTS_TABLE.update_item(
-            Key={'alertId': alert_id},
-            UpdateExpression='SET acknowledged = :ack, acknowledgedAt = :time',
-            ExpressionAttributeValues={
-                ':ack': True,
-                ':time': datetime.utcnow().isoformat()
-            },
-            ReturnValues='ALL_NEW'
-        )
-        
-        return {
-            'statusCode': 200,
-            'headers': get_cors_headers(),
-            'body': json.dumps({
-                'alert': convert_decimals(response['Attributes']),
-                'message': 'Alert acknowledged successfully'
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"Error acknowledging alert: {str(e)}")
-        raise
-
-def determine_category(alarm_name: str) -> str:
-    """Determine alert category based on alarm name"""
-    alarm_lower = alarm_name.lower()
-    if 'inventory' in alarm_lower or 'stock' in alarm_lower:
-        return 'inventory'
-    elif 'demand' in alarm_lower or 'forecast' in alarm_lower:
-        return 'demand'
-    elif 'supply' in alarm_lower or 'supplier' in alarm_lower:
-        return 'supply'
-    elif 'security' in alarm_lower or 'access' in alarm_lower:
-        return 'security'
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        result = ALERTS_TABLE.query(**kwargs)
     else:
-        return 'system'
+        kwargs = {}
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        result = ALERTS_TABLE.scan(**kwargs)
 
-def send_sns_notification(alert_data: Dict[str, Any]):
-    """Send SNS notification for critical alerts"""
-    try:
-        topic_arn = 'arn:aws:sns:us-east-1:123456789012:timewise-critical-alerts'
-        
-        message = {
-            'title': alert_data['title'],
-            'message': alert_data['message'],
-            'type': alert_data['type'],
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        sns.publish(
-            TopicArn=topic_arn,
-            Message=json.dumps(message),
-            Subject=f"TimeWise Critical Alert: {alert_data['title']}"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error sending SNS notification: {str(e)}")
+    items = sorted(
+        result.get("Items", []), key=lambda a: a.get("timestamp", ""), reverse=True
+    )
+    unacknowledged = sum(1 for a in items if not a.get("acknowledged"))
+    return json_response(
+        200,
+        list_response_body(
+            items, result.get("LastEvaluatedKey"), unacknowledged=unacknowledged
+        ),
+    )
 
-def convert_decimals(obj):
-    """Convert DynamoDB Decimal types to float for JSON serialization"""
-    if isinstance(obj, list):
-        return [convert_decimals(item) for item in obj]
-    elif isinstance(obj, dict):
-        return {key: convert_decimals(value) for key, value in obj.items()}
-    elif isinstance(obj, Decimal):
-        return float(obj)
-    else:
-        return obj
 
-def get_cors_headers():
-    """Return CORS headers for API responses"""
-    return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        'Content-Type': 'application/json'
+def _store_alert(data: Dict[str, Any]) -> Dict[str, Any]:
+    alert_type = data.get("type", "info")
+    if alert_type not in VALID_TYPES:
+        raise ValidationError(f"type must be one of: {', '.join(VALID_TYPES)}")
+
+    alert_item = {
+        "alertId": f"al-{uuid.uuid4()}",
+        "type": alert_type,
+        "category": data.get("category", "system"),
+        "title": data["title"],
+        "message": data.get("message", ""),
+        "timestamp": _now(),
+        "source": data.get("source", "System"),
+        "acknowledged": False,
+        "actionRequired": bool(data.get("actionRequired", False)),
+        "metadata": data.get("metadata", {}),
     }
+    ALERTS_TABLE.put_item(Item=alert_item)
+    put_metric(
+        cloudwatch,
+        f"{NAMESPACE}/Alerts",
+        "AlertsCreated",
+        1,
+        dimensions={"AlertType": alert_item["type"], "Category": alert_item["category"]},
+    )
+    return alert_item
+
+
+@router.route("POST", "/alerts")
+def create_alert(event: Dict[str, Any]) -> Dict[str, Any]:
+    body = parse_body(event)
+    require_fields(body, "title")
+    alert_item = _store_alert(body)
+    return json_response(201, {"alert": alert_item})
+
+
+@router.route("POST", "/alerts/{alert_id}/acknowledge")
+def acknowledge_alert(event: Dict[str, Any], alert_id: str) -> Dict[str, Any]:
+    return json_response(200, {"alert": _acknowledge(ALERTS_TABLE, "alertId", alert_id)})
+
+
+# --- Inventory alerts ---------------------------------------------------------
+
+
+@router.route("GET", "/inventory-alerts")
+def get_inventory_alerts(event: Dict[str, Any]) -> Dict[str, Any]:
+    params = event.get("queryStringParameters") or {}
+    start_key = decode_page_token(params.get("nextToken"))
+    product_id = params.get("productId")
+
+    if product_id:
+        kwargs: Dict[str, Any] = {
+            "IndexName": "ProductSeverityIndex",
+            "KeyConditionExpression": Key("productId").eq(product_id),
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        result = INVENTORY_ALERTS_TABLE.query(**kwargs)
+    else:
+        kwargs = {}
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        result = INVENTORY_ALERTS_TABLE.scan(**kwargs)
+
+    return json_response(
+        200, list_response_body(result.get("Items", []), result.get("LastEvaluatedKey"))
+    )
+
+
+@router.route("POST", "/inventory-alerts/{alert_id}/acknowledge")
+def acknowledge_inventory_alert(event: Dict[str, Any], alert_id: str) -> Dict[str, Any]:
+    return json_response(
+        200, {"alert": _acknowledge(INVENTORY_ALERTS_TABLE, "alertId", alert_id)}
+    )
+
+
+def _acknowledge(table: Any, key_name: str, key_value: str) -> Dict[str, Any]:
+    try:
+        result = table.update_item(
+            Key={key_name: key_value},
+            UpdateExpression="SET acknowledged = :ack, acknowledgedAt = :time",
+            ConditionExpression=f"attribute_exists({key_name})",
+            ExpressionAttributeValues={":ack": True, ":time": _now()},
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise NotFoundError(f"Alert {key_value} not found") from exc
+        raise
+    return result["Attributes"]
+
+
+# --- CloudWatch alarm intake (EventBridge) ------------------------------------
+
+
+def _determine_category(alarm_name: str) -> str:
+    lowered = alarm_name.lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return "system"
+
+
+def _handle_alarm_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    detail = event.get("detail", {})
+    alarm_name = detail.get("alarmName", "unknown-alarm")
+    state = detail.get("state", {})
+
+    if state.get("value") != "ALARM":
+        logger.info("Ignoring alarm %s in state %s", alarm_name, state.get("value"))
+        return {"statusCode": 200}
+
+    alert_item = _store_alert(
+        {
+            "type": "critical" if "critical" in alarm_name.lower() else "warning",
+            "category": _determine_category(alarm_name),
+            "title": f"CloudWatch Alarm: {alarm_name}",
+            "message": state.get("reason", "Alarm threshold breached"),
+            "source": "AWS CloudWatch",
+            "actionRequired": True,
+            "metadata": {
+                "alarmName": alarm_name,
+                "region": event.get("region", ""),
+                "accountId": event.get("account", ""),
+            },
+        }
+    )
+
+    if alert_item["type"] == "critical":
+        if SNS_TOPIC_ARN:
+            sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject=f"TimeWise Critical Alert: {alert_item['title']}"[:100],
+                Message=json.dumps(
+                    {
+                        "title": alert_item["title"],
+                        "message": alert_item["message"],
+                        "category": alert_item["category"],
+                        "timestamp": alert_item["timestamp"],
+                    }
+                ),
+            )
+        else:
+            logger.warning(
+                "SNS_TOPIC_ARN not configured; skipping notification for %s", alarm_name
+            )
+
+    return {"statusCode": 200}
+
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    if event.get("source") == "aws.cloudwatch":
+        return _handle_alarm_event(event)
+    return router.dispatch(event)

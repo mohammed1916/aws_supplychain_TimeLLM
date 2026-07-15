@@ -1,15 +1,20 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'DynamoDB tables for TimeWise Supply Chain platform'
+Description: >-
+  DynamoDB tables for the TimeWise Supply Chain platform. All tables use
+  on-demand capacity and point-in-time recovery; time-series tables expire
+  items via TTL. GSIs are provisioned only for access patterns the Lambda
+  services actually query.
 
 Parameters:
   Environment:
     Type: String
     Default: 'prod'
     AllowedValues: ['dev', 'staging', 'prod']
-    Description: 'Environment name'
+    Description: 'Environment name (suffixes every table name)'
 
 Resources:
-  # Forecasts Table
+  # --- Forecasting -----------------------------------------------------------
+
   ForecastsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -42,96 +47,8 @@ Resources:
         - Key: Application
           Value: TimeWise
 
-  # Inventory Alerts Table
-  InventoryAlertsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub 'timewise-inventory-alerts-${Environment}'
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: alertId
-          AttributeType: S
-        - AttributeName: productId
-          AttributeType: S
-        - AttributeName: severity
-          AttributeType: S
-      KeySchema:
-        - AttributeName: alertId
-          KeyType: HASH
-      GlobalSecondaryIndexes:
-        - IndexName: ProductSeverityIndex
-          KeySchema:
-            - AttributeName: productId
-              KeyType: HASH
-            - AttributeName: severity
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Application
-          Value: TimeWise
+  # --- Alerting ---------------------------------------------------------------
 
-  # KPIs Table
-  KPIsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub 'timewise-kpis-${Environment}'
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: kpiId
-          AttributeType: S
-        - AttributeName: timestamp
-          AttributeType: S
-      KeySchema:
-        - AttributeName: kpiId
-          KeyType: HASH
-        - AttributeName: timestamp
-          KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Application
-          Value: TimeWise
-
-  # Data Sources Table
-  DataSourcesTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: !Sub 'timewise-data-sources-${Environment}'
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: sourceId
-          AttributeType: S
-        - AttributeName: sourceType
-          AttributeType: S
-      KeySchema:
-        - AttributeName: sourceId
-          KeyType: HASH
-      GlobalSecondaryIndexes:
-        - IndexName: TypeIndex
-          KeySchema:
-            - AttributeName: sourceType
-              KeyType: HASH
-          Projection:
-            ProjectionType: ALL
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Application
-          Value: TimeWise
-
-  # Alerts Table
   AlertsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -164,7 +81,66 @@ Resources:
         - Key: Application
           Value: TimeWise
 
-  # Metrics Table
+  InventoryAlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-inventory-alerts-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alertId
+          AttributeType: S
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alertId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ProductSeverityIndex
+          KeySchema:
+            - AttributeName: productId
+              KeyType: HASH
+            - AttributeName: severity
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  # --- Data platform ------------------------------------------------------------
+
+  KPIsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-kpis-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: kpiId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: kpiId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
   MetricsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -191,7 +167,142 @@ Resources:
         - Key: Application
           Value: TimeWise
 
-  # Access Controls Table
+  DataSourcesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-data-sources-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sourceId
+          AttributeType: S
+        - AttributeName: sourceType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sourceId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TypeIndex
+          KeySchema:
+            - AttributeName: sourceType
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  # --- Optimization -------------------------------------------------------------
+
+  OptimizationScenariosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-optimization-scenarios-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scenarioId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scenarioId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  InventoryOptimizationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-inventory-optimizations-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: optimizationId
+          AttributeType: S
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: optimizationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ProductIndex
+          KeySchema:
+            - AttributeName: productId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  # --- Analytics ------------------------------------------------------------------
+
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-reports-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reportId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reportId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  AnalyticsInsightsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-analytics-insights-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: insightId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: insightId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryTimeIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  # --- Governance -------------------------------------------------------------------
+
   AccessControlsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -220,45 +331,111 @@ Resources:
         - Key: Application
           Value: TimeWise
 
+  GovernanceMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-governance-metrics-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  BiasDetectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'timewise-bias-detections-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: detectionId
+          AttributeType: S
+        - AttributeName: modelComponent
+          AttributeType: S
+        - AttributeName: detectedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: detectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ModelIndex
+          KeySchema:
+            - AttributeName: modelComponent
+              KeyType: HASH
+            - AttributeName: detectedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
 Outputs:
   ForecastsTableName:
-    Description: 'Name of the Forecasts DynamoDB table'
     Value: !Ref ForecastsTable
     Export:
       Name: !Sub '${AWS::StackName}-ForecastsTable'
-
-  InventoryAlertsTableName:
-    Description: 'Name of the Inventory Alerts DynamoDB table'
-    Value: !Ref InventoryAlertsTable
-    Export:
-      Name: !Sub '${AWS::StackName}-InventoryAlertsTable'
-
-  KPIsTableName:
-    Description: 'Name of the KPIs DynamoDB table'
-    Value: !Ref KPIsTable
-    Export:
-      Name: !Sub '${AWS::StackName}-KPIsTable'
-
-  DataSourcesTableName:
-    Description: 'Name of the Data Sources DynamoDB table'
-    Value: !Ref DataSourcesTable
-    Export:
-      Name: !Sub '${AWS::StackName}-DataSourcesTable'
-
   AlertsTableName:
-    Description: 'Name of the Alerts DynamoDB table'
     Value: !Ref AlertsTable
     Export:
       Name: !Sub '${AWS::StackName}-AlertsTable'
-
+  InventoryAlertsTableName:
+    Value: !Ref InventoryAlertsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryAlertsTable'
+  KPIsTableName:
+    Value: !Ref KPIsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-KPIsTable'
   MetricsTableName:
-    Description: 'Name of the Metrics DynamoDB table'
     Value: !Ref MetricsTable
     Export:
       Name: !Sub '${AWS::StackName}-MetricsTable'
-
+  DataSourcesTableName:
+    Value: !Ref DataSourcesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSourcesTable'
+  OptimizationScenariosTableName:
+    Value: !Ref OptimizationScenariosTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OptimizationScenariosTable'
+  InventoryOptimizationsTableName:
+    Value: !Ref InventoryOptimizationsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryOptimizationsTable'
+  ReportsTableName:
+    Value: !Ref ReportsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ReportsTable'
+  AnalyticsInsightsTableName:
+    Value: !Ref AnalyticsInsightsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsInsightsTable'
   AccessControlsTableName:
-    Description: 'Name of the Access Controls DynamoDB table'
     Value: !Ref AccessControlsTable
     Export:
       Name: !Sub '${AWS::StackName}-AccessControlsTable'
+  GovernanceMetricsTableName:
+    Value: !Ref GovernanceMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GovernanceMetricsTable'
+  BiasDetectionsTableName:
+    Value: !Ref BiasDetectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-BiasDetectionsTable'

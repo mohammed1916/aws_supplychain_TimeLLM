@@ -25,11 +25,7 @@ interface DataSource {
   dataQuality: number;
 }
 
-interface DataIngestionPanelProps {
-  onDataUpdate: (data: any) => void;
-}
-
-export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUpdate }) => {
+export const DataIngestionPanel: React.FC = () => {
   const { 
     data: apiDataSources, 
     loading, 
@@ -78,7 +74,17 @@ export const DataIngestionPanel: React.FC<DataIngestionPanelProps> = ({ onDataUp
     }
   ];
 
-  const dataSources = apiDataSources || defaultDataSources;
+  const dataSources = apiDataSources?.items?.length
+    ? apiDataSources.items.map((s) => ({
+        id: s.sourceId,
+        name: s.name,
+        type: s.sourceType,
+        status: s.status,
+        lastSync: s.lastSync,
+        recordsProcessed: s.recordsProcessed,
+        dataQuality: s.dataQuality,
+      }))
+    : defaultDataSources;
 
   const [processingStats, setProcessingStats] = useState({
     totalRecords: 3062260,

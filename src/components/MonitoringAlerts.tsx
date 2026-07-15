@@ -1,10 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { 
   Bell, 
   AlertTriangle, 
   CheckCircle, 
   XCircle,
-  Clock,
   TrendingUp,
   TrendingDown,
   Activity,
@@ -106,7 +105,7 @@ export const MonitoringAlerts: React.FC = () => {
     }
   ]);
 
-  const [metrics, setMetrics] = useState<MetricCard[]>([
+  const [metrics] = useState<MetricCard[]>([
     {
       id: 'forecast-accuracy',
       name: 'Forecast Accuracy',

@@ -1,47 +1,43 @@
-// AWS Configuration
+// Frontend runtime configuration.
+// Vite exposes environment variables on `import.meta.env` (never `process.env`),
+// and only variables prefixed with VITE_ reach the browser bundle.
+
+const env = import.meta.env;
+
 export const AWS_CONFIG = {
-  region: process.env.VITE_AWS_REGION || 'us-east-1',
+  region: env.VITE_AWS_REGION ?? 'us-east-1',
   apiGateway: {
-    baseUrl: process.env.VITE_API_GATEWAY_URL || 'https://your-api-gateway-url.execute-api.us-east-1.amazonaws.com/prod'
+    baseUrl: (env.VITE_API_GATEWAY_URL ?? '').replace(/\/+$/, ''),
   },
-  dynamodb: {
-    tables: {
-      forecasts: 'timewise-forecasts',
-      inventoryAlerts: 'timewise-inventory-alerts',
-      kpis: 'timewise-kpis',
-      dataSources: 'timewise-data-sources',
-      optimizationScenarios: 'timewise-optimization-scenarios',
-      inventoryOptimizations: 'timewise-inventory-optimizations',
-      alerts: 'timewise-alerts',
-      metrics: 'timewise-metrics',
-      reports: 'timewise-reports',
-      analyticsInsights: 'timewise-analytics-insights',
-      accessControls: 'timewise-access-controls',
-      governanceMetrics: 'timewise-governance-metrics',
-      biasDetections: 'timewise-bias-detections'
-    }
+  auth: {
+    // Reserved for Cognito integration; unused until authentication ships.
+    userPoolId: env.VITE_COGNITO_USER_POOL_ID ?? '',
+    clientId: env.VITE_COGNITO_CLIENT_ID ?? '',
   },
-  sagemaker: {
-    endpointName: process.env.VITE_SAGEMAKER_ENDPOINT || 'timellm-forecast-endpoint'
+  features: {
+    realTimeUpdates: env.VITE_ENABLE_REAL_TIME_UPDATES !== 'false',
+    advancedAnalytics: env.VITE_ENABLE_ADVANCED_ANALYTICS !== 'false',
+    aiInsights: env.VITE_ENABLE_AI_INSIGHTS !== 'false',
   },
-  cloudwatch: {
-    namespace: 'TimeWise/SupplyChain'
-  }
-};
+} as const;
+
+export const isApiConfigured = (): boolean => AWS_CONFIG.apiGateway.baseUrl.length > 0;
+
+const base = AWS_CONFIG.apiGateway.baseUrl;
 
 export const API_ENDPOINTS = {
-  forecasts: `${AWS_CONFIG.apiGateway.baseUrl}/forecasts`,
-  inventoryAlerts: `${AWS_CONFIG.apiGateway.baseUrl}/inventory-alerts`,
-  kpis: `${AWS_CONFIG.apiGateway.baseUrl}/kpis`,
-  dataSources: `${AWS_CONFIG.apiGateway.baseUrl}/data-sources`,
-  optimizationScenarios: `${AWS_CONFIG.apiGateway.baseUrl}/optimization-scenarios`,
-  inventoryOptimizations: `${AWS_CONFIG.apiGateway.baseUrl}/inventory-optimizations`,
-  alerts: `${AWS_CONFIG.apiGateway.baseUrl}/alerts`,
-  metrics: `${AWS_CONFIG.apiGateway.baseUrl}/metrics`,
-  reports: `${AWS_CONFIG.apiGateway.baseUrl}/reports`,
-  analyticsInsights: `${AWS_CONFIG.apiGateway.baseUrl}/analytics-insights`,
-  accessControls: `${AWS_CONFIG.apiGateway.baseUrl}/access-controls`,
-  governanceMetrics: `${AWS_CONFIG.apiGateway.baseUrl}/governance-metrics`,
-  biasDetections: `${AWS_CONFIG.apiGateway.baseUrl}/bias-detections`,
-  sagemakerInference: `${AWS_CONFIG.apiGateway.baseUrl}/sagemaker/inference`
-};
+  forecasts: `${base}/forecasts`,
+  inventoryAlerts: `${base}/inventory-alerts`,
+  kpis: `${base}/kpis`,
+  dataSources: `${base}/data-sources`,
+  optimizationScenarios: `${base}/optimization-scenarios`,
+  inventoryOptimizations: `${base}/inventory-optimizations`,
+  alerts: `${base}/alerts`,
+  metrics: `${base}/metrics`,
+  reports: `${base}/reports`,
+  analyticsInsights: `${base}/analytics-insights`,
+  accessControls: `${base}/access-controls`,
+  governanceMetrics: `${base}/governance-metrics`,
+  biasDetections: `${base}/bias-detections`,
+  sagemakerInference: `${base}/sagemaker/inference`,
+} as const;

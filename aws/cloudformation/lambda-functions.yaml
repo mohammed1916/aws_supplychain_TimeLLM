@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Lambda services for the TimeWise Supply Chain platform: six domain functions
+  with least-privilege IAM roles, environment-injected table names, X-Ray
+  tracing, a shared dead-letter queue, log retention, the critical-alerts SNS
+  topic, and the EventBridge rule that feeds CloudWatch alarm state changes
+  into the alerts service.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+  CodeBucket:
+    Type: String
+    Description: 'S3 bucket holding the packaged function zips'
+  CodeKeyPrefix:
+    Type: String
+    Default: 'lambda/'
+    Description: 'Key prefix under which <service>-handler.zip objects live'
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  SageMakerEndpointName:
+    Type: String
+    Default: ''
+    Description: 'TimeLLM endpoint name; leave empty to deploy without a model'
+  StateMachineArn:
+    Type: String
+    Default: ''
+    Description: 'Step Functions state machine that executes optimization runs'
+  ReportsBucket:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket for rendered report artifacts'
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: 'Optional email subscription for critical alerts'
+
+Conditions:
+  HasSageMakerEndpoint: !Not [!Equals [!Ref SageMakerEndpointName, '']]
+  HasStateMachine: !Not [!Equals [!Ref StateMachineArn, '']]
+  HasReportsBucket: !Not [!Equals [!Ref ReportsBucket, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # --- Shared operational resources -------------------------------------------
+
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'timewise-critical-alerts-${Environment}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  CriticalAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref CriticalAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'timewise-lambda-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days for failed-event forensics
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TimeWise
+
+  # --- Forecasts service --------------------------------------------------------
+
+  ForecastsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-forecasts-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: forecasts-data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-forecasts-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-forecasts-${Environment}/index/*'
+              - !If
+                - HasSageMakerEndpoint
+                - Effect: Allow
+                  Action: sagemaker:InvokeEndpoint
+                  Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}'
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  ForecastsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-forecasts-${Environment}'
+      Description: 'Forecast CRUD + SageMaker TimeLLM inference'
+      Runtime: python3.12
+      Handler: forecasts-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}forecasts-handler.zip'
+      Role: !GetAtt ForecastsFunctionRole.Arn
+      MemorySize: 512
+      Timeout: 29  # bounded by the API Gateway integration limit
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          FORECASTS_TABLE: !Sub 'timewise-forecasts-${Environment}'
+          SAGEMAKER_ENDPOINT: !If [HasSageMakerEndpoint, !Ref SageMakerEndpointName, !Ref 'AWS::NoValue']
+          METRICS_NAMESPACE: TimeWise
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  ForecastsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ForecastsFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- Alerts service -------------------------------------------------------------
+
+  AlertsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-alerts-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: alerts-data-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-alerts-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-alerts-${Environment}/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-inventory-alerts-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-inventory-alerts-${Environment}/index/*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref CriticalAlertsTopic
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  AlertsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-alerts-${Environment}'
+      Description: 'Alert CRUD, CloudWatch alarm intake, SNS escalation'
+      Runtime: python3.12
+      Handler: alerts-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}alerts-handler.zip'
+      Role: !GetAtt AlertsFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          ALERTS_TABLE: !Sub 'timewise-alerts-${Environment}'
+          INVENTORY_ALERTS_TABLE: !Sub 'timewise-inventory-alerts-${Environment}'
+          SNS_TOPIC_ARN: !Ref CriticalAlertsTopic
+          METRICS_NAMESPACE: TimeWise
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  AlertsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AlertsFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # CloudWatch alarm state changes -> alerts service
+  AlarmStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'timewise-alarm-intake-${Environment}'
+      Description: 'Route CloudWatch alarm state changes into the alerts service'
+      EventPattern:
+        source: ['aws.cloudwatch']
+        detail-type: ['CloudWatch Alarm State Change']
+      Targets:
+        - Id: alerts-service
+          Arn: !GetAtt AlertsFunction.Arn
+
+  AlarmRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmStateChangeRule.Arn
+
+  # --- Data-platform service --------------------------------------------------------
+
+  DataPlatformFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-data-platform-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: data-platform-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-kpis-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-metrics-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-data-sources-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-data-sources-${Environment}/index/*'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  DataPlatformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-data-platform-${Environment}'
+      Description: 'KPIs, operational metrics, data-source registry'
+      Runtime: python3.12
+      Handler: data-platform-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}data-platform-handler.zip'
+      Role: !GetAtt DataPlatformFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          KPIS_TABLE: !Sub 'timewise-kpis-${Environment}'
+          METRICS_TABLE: !Sub 'timewise-metrics-${Environment}'
+          DATA_SOURCES_TABLE: !Sub 'timewise-data-sources-${Environment}'
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  DataPlatformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataPlatformFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- Optimization service ------------------------------------------------------------
+
+  OptimizationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-optimization-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: optimization-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-optimization-scenarios-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-inventory-optimizations-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-inventory-optimizations-${Environment}/index/*'
+              - !If
+                - HasStateMachine
+                - Effect: Allow
+                  Action: states:StartExecution
+                  Resource: !Ref StateMachineArn
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  OptimizationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-optimization-${Environment}'
+      Description: 'Optimization scenarios and inventory recommendations'
+      Runtime: python3.12
+      Handler: optimization-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}optimization-handler.zip'
+      Role: !GetAtt OptimizationFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          SCENARIOS_TABLE: !Sub 'timewise-optimization-scenarios-${Environment}'
+          INVENTORY_OPTIMIZATIONS_TABLE: !Sub 'timewise-inventory-optimizations-${Environment}'
+          STATE_MACHINE_ARN: !If [HasStateMachine, !Ref StateMachineArn, !Ref 'AWS::NoValue']
+          METRICS_NAMESPACE: TimeWise
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  OptimizationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${OptimizationFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- Analytics service ----------------------------------------------------------------
+
+  AnalyticsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-analytics-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: analytics-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-reports-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-analytics-insights-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-analytics-insights-${Environment}/index/*'
+              - !If
+                - HasReportsBucket
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                  Resource: !Sub 'arn:aws:s3:::${ReportsBucket}/reports/*'
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  AnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-analytics-${Environment}'
+      Description: 'Report generation and AI insights'
+      Runtime: python3.12
+      Handler: analytics-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}analytics-handler.zip'
+      Role: !GetAtt AnalyticsFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 29
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          REPORTS_TABLE: !Sub 'timewise-reports-${Environment}'
+          INSIGHTS_TABLE: !Sub 'timewise-analytics-insights-${Environment}'
+          REPORTS_BUCKET: !If [HasReportsBucket, !Ref ReportsBucket, !Ref 'AWS::NoValue']
+          METRICS_NAMESPACE: TimeWise
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AnalyticsFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- Governance service -----------------------------------------------------------------
+
+  GovernanceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-governance-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: governance-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-access-controls-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-access-controls-${Environment}/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-governance-metrics-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-bias-detections-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/timewise-bias-detections-${Environment}/index/*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  GovernanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'timewise-governance-${Environment}'
+      Description: 'RBAC access controls, AI governance metrics, bias detections'
+      Runtime: python3.12
+      Handler: governance-handler.lambda_handler
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Sub '${CodeKeyPrefix}governance-handler.zip'
+      Role: !GetAtt GovernanceFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      TracingConfig: {Mode: Active}
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      Environment:
+        Variables:
+          ACCESS_CONTROLS_TABLE: !Sub 'timewise-access-controls-${Environment}'
+          GOVERNANCE_METRICS_TABLE: !Sub 'timewise-governance-metrics-${Environment}'
+          BIAS_DETECTIONS_TABLE: !Sub 'timewise-bias-detections-${Environment}'
+          METRICS_NAMESPACE: TimeWise
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  GovernanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GovernanceFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  ForecastsFunctionArn:
+    Value: !GetAtt ForecastsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ForecastsFunctionArn'
+  AlertsFunctionArn:
+    Value: !GetAtt AlertsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsFunctionArn'
+  DataPlatformFunctionArn:
+    Value: !GetAtt DataPlatformFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataPlatformFunctionArn'
+  OptimizationFunctionArn:
+    Value: !GetAtt OptimizationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OptimizationFunctionArn'
+  AnalyticsFunctionArn:
+    Value: !GetAtt AnalyticsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsFunctionArn'
+  GovernanceFunctionArn:
+    Value: !GetAtt GovernanceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GovernanceFunctionArn'
+  CriticalAlertsTopicArn:
+    Value: !Ref CriticalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalAlertsTopicArn'

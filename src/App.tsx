@@ -1,8 +1,7 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { 
   BarChart3, 
   TrendingUp, 
-  Package, 
   AlertTriangle, 
   Activity,
   Settings,
@@ -77,10 +76,22 @@ function App() {
     { label: 'Cost Savings', value: '$2.1M', change: '+$340K', trend: 'up' }
   ];
 
-  // Use API data if available, otherwise fall back to static data
-  const displayForecastData = forecastData || defaultForecastData;
-  const displayInventoryAlerts = inventoryAlerts || defaultInventoryAlerts;
-  const displayKpiData = kpiData || defaultKpiData;
+  // Use API data if available, otherwise fall back to static demo data.
+  // The API returns { items, count } envelopes; the chart consumes the most
+  // recent forecast's prediction periods.
+  const latestForecast = forecastData?.items?.[0];
+  const displayForecastData = latestForecast
+    ? latestForecast.predictions.map((p) => ({
+        month: p.period,
+        demand: p.demand,
+        actual: null as number | null,
+        accuracy: null as number | null,
+      }))
+    : defaultForecastData;
+  const displayInventoryAlerts = inventoryAlerts?.items?.length
+    ? inventoryAlerts.items
+    : defaultInventoryAlerts;
+  const displayKpiData = kpiData?.items?.length ? kpiData.items : defaultKpiData;
 
   const awsServices = [
     {
@@ -373,7 +384,7 @@ function App() {
           )}
 
           {activeTab === 'data-ingestion' && (
-            <DataIngestionPanel onDataUpdate={() => {}} />
+            <DataIngestionPanel />
           )}
 
           {activeTab === 'optimization' && (

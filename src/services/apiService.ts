@@ -1,149 +1,207 @@
-import { API_ENDPOINTS } from '../config/aws';
+import { API_ENDPOINTS, isApiConfigured } from '../config/aws';
+import type {
+  AccessControl,
+  Alert,
+  AlertsResponse,
+  AnalyticsInsight,
+  BiasDetection,
+  DataSource,
+  Forecast,
+  ForecastsResponse,
+  GovernanceMetric,
+  InferenceRequest,
+  InferenceResponse,
+  InventoryAlert,
+  InventoryAlertsResponse,
+  InventoryOptimization,
+  KPI,
+  ListResponse,
+  MetricPoint,
+  OptimizationScenario,
+  Report,
+} from '../types';
+
+const REQUEST_TIMEOUT_MS = 15_000;
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly body?: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
 class ApiService {
-  private async fetchWithAuth(url: string, options: RequestInit = {}) {
-    const defaultHeaders = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${localStorage.getItem('authToken') || ''}`,
-    };
-
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        ...defaultHeaders,
-        ...options.headers,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+  private async request<T>(url: string, options: RequestInit = {}): Promise<T> {
+    if (!isApiConfigured()) {
+      throw new ApiError('API Gateway URL is not configured (set VITE_API_GATEWAY_URL)', 0);
     }
 
-    return response.json();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers as Record<string, string>),
+    };
+
+    const token = localStorage.getItem('authToken');
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    try {
+      const response = await fetch(url, { ...options, headers, signal: controller.signal });
+
+      if (!response.ok) {
+        let body: unknown;
+        try {
+          body = await response.json();
+        } catch {
+          body = undefined;
+        }
+        throw new ApiError(`${response.status} ${response.statusText}`, response.status, body);
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
+      }
+      return (await response.json()) as T;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new ApiError(`Request timed out after ${REQUEST_TIMEOUT_MS} ms`, 0);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
-  // Forecast Data
-  async getForecasts() {
-    return this.fetchWithAuth(API_ENDPOINTS.forecasts);
+  private get<T>(url: string): Promise<T> {
+    return this.request<T>(url);
   }
 
-  async updateForecast(forecastId: string, data: any) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.forecasts}/${forecastId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
+  private post<T>(url: string, body?: unknown): Promise<T> {
+    return this.request<T>(url, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
   }
 
-  // Inventory Alerts
-  async getInventoryAlerts() {
-    return this.fetchWithAuth(API_ENDPOINTS.inventoryAlerts);
+  private put<T>(url: string, body: unknown): Promise<T> {
+    return this.request<T>(url, { method: 'PUT', body: JSON.stringify(body) });
   }
 
-  async acknowledgeAlert(alertId: string) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.inventoryAlerts}/${alertId}/acknowledge`, {
-      method: 'POST',
-    });
+  // Forecasts
+  getForecasts(productId?: string): Promise<ForecastsResponse> {
+    const query = productId ? `?productId=${encodeURIComponent(productId)}` : '';
+    return this.get(`${API_ENDPOINTS.forecasts}${query}`);
+  }
+
+  createForecast(input: InferenceRequest): Promise<{ forecast: Forecast }> {
+    return this.post(API_ENDPOINTS.forecasts, input);
+  }
+
+  updateForecast(forecastId: string, data: Partial<Pick<Forecast, 'status'>>): Promise<{ forecast: Forecast }> {
+    return this.put(`${API_ENDPOINTS.forecasts}/${forecastId}`, data);
+  }
+
+  // Inventory alerts
+  getInventoryAlerts(): Promise<InventoryAlertsResponse> {
+    return this.get(API_ENDPOINTS.inventoryAlerts);
+  }
+
+  acknowledgeInventoryAlert(alertId: string): Promise<{ alert: InventoryAlert }> {
+    return this.post(`${API_ENDPOINTS.inventoryAlerts}/${alertId}/acknowledge`);
   }
 
   // KPIs
-  async getKPIs() {
-    return this.fetchWithAuth(API_ENDPOINTS.kpis);
+  getKPIs(): Promise<ListResponse<KPI>> {
+    return this.get(API_ENDPOINTS.kpis);
   }
 
-  // Data Sources
-  async getDataSources() {
-    return this.fetchWithAuth(API_ENDPOINTS.dataSources);
+  // Data sources
+  getDataSources(): Promise<ListResponse<DataSource>> {
+    return this.get(API_ENDPOINTS.dataSources);
   }
 
-  async updateDataSource(sourceId: string, data: any) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.dataSources}/${sourceId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    });
+  updateDataSource(sourceId: string, data: Partial<DataSource>): Promise<{ dataSource: DataSource }> {
+    return this.put(`${API_ENDPOINTS.dataSources}/${sourceId}`, data);
   }
 
-  // Optimization Scenarios
-  async getOptimizationScenarios() {
-    return this.fetchWithAuth(API_ENDPOINTS.optimizationScenarios);
+  // Optimization scenarios
+  getOptimizationScenarios(): Promise<ListResponse<OptimizationScenario>> {
+    return this.get(API_ENDPOINTS.optimizationScenarios);
   }
 
-  async runOptimization(scenarioId: string) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.optimizationScenarios}/${scenarioId}/run`, {
-      method: 'POST',
-    });
+  runOptimization(scenarioId: string): Promise<{ scenario: OptimizationScenario }> {
+    return this.post(`${API_ENDPOINTS.optimizationScenarios}/${scenarioId}/run`);
   }
 
-  // Inventory Optimizations
-  async getInventoryOptimizations() {
-    return this.fetchWithAuth(API_ENDPOINTS.inventoryOptimizations);
+  // Inventory optimizations
+  getInventoryOptimizations(): Promise<ListResponse<InventoryOptimization>> {
+    return this.get(API_ENDPOINTS.inventoryOptimizations);
   }
 
-  async applyOptimization(optimizationId: string) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.inventoryOptimizations}/${optimizationId}/apply`, {
-      method: 'POST',
-    });
+  applyOptimization(optimizationId: string): Promise<{ optimization: InventoryOptimization }> {
+    return this.post(`${API_ENDPOINTS.inventoryOptimizations}/${optimizationId}/apply`);
   }
 
   // Alerts
-  async getAlerts() {
-    return this.fetchWithAuth(API_ENDPOINTS.alerts);
+  getAlerts(category?: string): Promise<AlertsResponse> {
+    const query = category ? `?category=${encodeURIComponent(category)}` : '';
+    return this.get(`${API_ENDPOINTS.alerts}${query}`);
   }
 
-  async acknowledgeAlert(alertId: string) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.alerts}/${alertId}/acknowledge`, {
-      method: 'POST',
-    });
+  createAlert(alert: Partial<Alert>): Promise<{ alert: Alert }> {
+    return this.post(API_ENDPOINTS.alerts, alert);
+  }
+
+  acknowledgeAlert(alertId: string): Promise<{ alert: Alert }> {
+    return this.post(`${API_ENDPOINTS.alerts}/${alertId}/acknowledge`);
   }
 
   // Metrics
-  async getMetrics() {
-    return this.fetchWithAuth(API_ENDPOINTS.metrics);
+  getMetrics(): Promise<ListResponse<MetricPoint>> {
+    return this.get(API_ENDPOINTS.metrics);
   }
 
   // Reports
-  async getReports() {
-    return this.fetchWithAuth(API_ENDPOINTS.reports);
+  getReports(): Promise<ListResponse<Report>> {
+    return this.get(API_ENDPOINTS.reports);
   }
 
-  async generateReport(reportId: string) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.reports}/${reportId}/generate`, {
-      method: 'POST',
-    });
+  generateReport(reportId: string): Promise<{ report: Report }> {
+    return this.post(`${API_ENDPOINTS.reports}/${reportId}/generate`);
   }
 
-  // Analytics Insights
-  async getAnalyticsInsights() {
-    return this.fetchWithAuth(API_ENDPOINTS.analyticsInsights);
+  // Analytics insights
+  getAnalyticsInsights(): Promise<ListResponse<AnalyticsInsight>> {
+    return this.get(API_ENDPOINTS.analyticsInsights);
   }
 
-  // Access Controls
-  async getAccessControls() {
-    return this.fetchWithAuth(API_ENDPOINTS.accessControls);
+  // Access controls
+  getAccessControls(): Promise<ListResponse<AccessControl>> {
+    return this.get(API_ENDPOINTS.accessControls);
   }
 
-  async updateUserAccess(userId: string, permissions: string[]) {
-    return this.fetchWithAuth(`${API_ENDPOINTS.accessControls}/${userId}`, {
-      method: 'PUT',
-      body: JSON.stringify({ permissions }),
-    });
+  updateUserAccess(userId: string, permissions: string[]): Promise<{ accessControl: AccessControl }> {
+    return this.put(`${API_ENDPOINTS.accessControls}/${userId}`, { permissions });
   }
 
-  // Governance Metrics
-  async getGovernanceMetrics() {
-    return this.fetchWithAuth(API_ENDPOINTS.governanceMetrics);
+  // Governance
+  getGovernanceMetrics(): Promise<ListResponse<GovernanceMetric>> {
+    return this.get(API_ENDPOINTS.governanceMetrics);
   }
 
-  // Bias Detections
-  async getBiasDetections() {
-    return this.fetchWithAuth(API_ENDPOINTS.biasDetections);
+  getBiasDetections(): Promise<ListResponse<BiasDetection>> {
+    return this.get(API_ENDPOINTS.biasDetections);
   }
 
-  // SageMaker Inference
-  async runSageMakerInference(inputData: any) {
-    return this.fetchWithAuth(API_ENDPOINTS.sagemakerInference, {
-      method: 'POST',
-      body: JSON.stringify(inputData),
-    });
+  // Direct SageMaker inference (proxied through the forecasts service)
+  runSageMakerInference(input: InferenceRequest): Promise<InferenceResponse> {
+    return this.post(API_ENDPOINTS.sagemakerInference, input);
   }
 }
 

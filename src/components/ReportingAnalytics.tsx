@@ -1,16 +1,13 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { 
   BarChart3, 
   TrendingUp, 
   Download, 
-  Calendar,
   Filter,
   PieChart,
   LineChart,
-  Users,
   DollarSign,
   Package,
-  Clock,
   Target,
   Award
 } from 'lucide-react';
