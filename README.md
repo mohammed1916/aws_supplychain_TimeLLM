@@ -334,30 +334,48 @@ Reproduce every count with [Reproducing These Counts](#reproducing-these-counts)
 | [monitoring.yaml](aws/cloudformation/monitoring.yaml) | 10 | 9 alarms + operations dashboard |
 | [data-lake.yaml](aws/cloudformation/data-lake.yaml) | 7 | 2 encrypted buckets, Glue database/role/job/trigger/crawler |
 
-### B. Backend — 6 services, 24 routes, 34 tests
+### B. Authentication — end-to-end
+
+| Element | Implementation | Where |
+|---|---|---|
+| User pool | Email sign-in, **12-character minimum** password policy with all character classes, admin-only account creation, email recovery, token revocation enabled, advanced security in AUDIT mode | [cognito.yaml](aws/cloudformation/cognito.yaml) |
+| SPA client | No client secret (browser clients cannot keep one), `ALLOW_USER_PASSWORD_AUTH` + `ALLOW_REFRESH_TOKEN_AUTH` only, 1 h ID/access tokens, 30-day refresh tokens | [cognito.yaml](aws/cloudformation/cognito.yaml) |
+| API authorizer | `COGNITO_USER_POOLS` authorizer on **all 22 ANY methods**; conditional (`Fn::If HasUserPool`) so a dev API deploys unauthenticated when `UserPoolArn` is omitted | [api-gateway.yaml](aws/cloudformation/api-gateway.yaml) |
+| CORS preflight | Browsers send preflight `OPTIONS` requests **without** an Authorization header, so an authorizer on OPTIONS would break CORS entirely — **23 unauthenticated MOCK OPTIONS methods** answer preflights while every data route stays JWT-protected | [api-gateway.yaml](aws/cloudformation/api-gateway.yaml) |
+| Sign-in flows | Cognito IDP JSON protocol over plain `fetch` (no SDK): `InitiateAuth` (USER_PASSWORD_AUTH), `RespondToAuthChallenge` (forced password rotation), `REFRESH_TOKEN_AUTH` silent renewal deduplicated across concurrent polling hooks, `RevokeToken` on sign-out | [src/services/authService.ts](src/services/authService.ts) |
+| Login UI | Sign-in + NEW_PASSWORD_REQUIRED challenge handling; the app renders in demo mode without a login gate when Cognito is unconfigured | [src/components/LoginPage.tsx](src/components/LoginPage.tsx), gate in [src/App.tsx](src/App.tsx) |
+| Token injection | Every API request awaits a valid ID token (refreshing if within 60 s of expiry) and sends it as a bearer header | [src/services/apiService.ts](src/services/apiService.ts) |
+| Audited identity | Permission changes log the **verified** `email`/`sub` claims that API Gateway injects after JWT validation — not a client-supplied header | [aws/lambda/governance-handler.py](aws/lambda/governance-handler.py) |
+| Known tradeoff | Tokens in `localStorage` (documented in code); stricter posture = httpOnly cookies behind a BFF (roadmap) | [src/services/authService.ts](src/services/authService.ts) |
+
+### C. Backend — 6 services, 24 routes, 34 tests
 
 Python 3.12, X-Ray traced, DLQ-attached, env-var configuration throughout. Notable per-service behaviors: model-unavailable (503) vs malformed-model-output (502) taxonomy in forecasts; dual-trigger alarm intake with 5-category classification in alerts; latest-per-series KPI reduction; 202 + idempotency guards in optimization; S3 artifacts + presigned URLs in analytics; closed permission vocabulary with Cognito-identity audit records in governance. The test suite ([aws/lambda/tests/](aws/lambda/tests/)) stubs boto3/botocore in `sys.modules`, so it runs with the standard library alone.
 
-### C. Frontend — auth + typed client + resilient polling
+### D. Frontend — typed client + resilient polling
 
-- [authService.ts](src/services/authService.ts): Cognito IDP protocol client — sign-in, NEW_PASSWORD_REQUIRED challenge, deduplicated silent refresh, sign-out with server-side token revocation.
 - [apiService.ts](src/services/apiService.ts): 24 typed methods, 15 s timeouts, `ApiError` with status+body, JWT injection.
 - [useApiData.ts](src/hooks/useApiData.ts): 13 domain hooks over one generic hook — hidden-tab pause, exponential backoff (cap 5 min), unmount-safe.
 - [LoginPage.tsx](src/components/LoginPage.tsx): sign-in + forced password rotation; the app runs in demo mode when Cognito is unconfigured.
 
-### D. Data & ML
+### E. Data & ML
 
 - [etl_sales_data.py](aws/glue/etl_sales_data.py): PySpark job — schema enforcement, positive-quantity/price coercion rules, quarantine zone for rejects (not silent drops), most-recent-wins dedup by window function, year/month-partitioned snappy Parquet, throughput metrics.
 - [inference.py](aws/sagemaker/inference.py): SageMaker PyTorch serving contract (`model_fn`/`input_fn`/`predict_fn`/`output_fn`) producing quantile forecasts with prediction intervals, matching the Lambda request/response contract exactly.
 - [deploy.py](aws/sagemaker/deploy.py): endpoint deploy/teardown tooling with cost guardrails.
 
-### E. Codebase Statistics
+### F. Codebase Statistics
 
 8,753 lines across TypeScript/TSX, Python, and YAML (source, tests, infrastructure, CI).
 
 ### Reproducing These Counts
 
 ```bash
+# Auth wiring: 22 authorized ANY methods, 23 open OPTIONS methods
+grep -c "HttpMethod: ANY"     aws/cloudformation/api-gateway.yaml
+grep -c "HttpMethod: OPTIONS" aws/cloudformation/api-gateway.yaml
+grep -c "AuthorizerId: !If"   aws/cloudformation/api-gateway.yaml
+
 # Infrastructure: 13 tables, 8 GSIs, 6 functions, 9 alarms, 6 stacks
 grep -c "AWS::DynamoDB::Table"     aws/cloudformation/dynamodb-tables.yaml
 grep -c "IndexName:"               aws/cloudformation/dynamodb-tables.yaml
