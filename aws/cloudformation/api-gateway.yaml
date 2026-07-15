@@ -2,14 +2,20 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   API Gateway REST API for the TimeWise Supply Chain platform. Each top-level
   resource plus a greedy {proxy+} child is routed via Lambda-proxy integration
-  to one of six domain services; method-level routing and CORS preflight are
-  handled inside the Lambda router.
+  to one of six domain services. When UserPoolArn is provided, every ANY method
+  requires a Cognito JWT; dedicated MOCK OPTIONS methods stay unauthenticated
+  so browser CORS preflights succeed. Method-level routing is handled inside
+  the Lambda router.
 
 Parameters:
   Environment:
     Type: String
     Default: 'prod'
     AllowedValues: ['dev', 'staging', 'prod']
+  UserPoolArn:
+    Type: String
+    Default: ''
+    Description: 'Cognito user pool ARN; leave empty to deploy without authentication'
   ForecastsLambdaArn:
     Type: String
     Description: 'Forecasts service (also serves /sagemaker/inference)'
@@ -29,6 +35,9 @@ Parameters:
     Type: String
     Description: 'Governance service (/access-controls, /governance-metrics, /bias-detections)'
 
+Conditions:
+  HasUserPool: !Not [!Equals [!Ref UserPoolArn, '']]
+
 Resources:
   TimeWiseAPI:
     Type: AWS::ApiGateway::RestApi
@@ -37,6 +46,17 @@ Resources:
       Description: 'TimeWise Supply Chain API'
       EndpointConfiguration:
         Types: [REGIONAL]
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: HasUserPool
+    Properties:
+      Name: !Sub 'timewise-cognito-${Environment}'
+      RestApiId: !Ref TimeWiseAPI
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Ref UserPoolArn
 
   # --- Lambda invoke permissions (one per service) -----------------------------
 
@@ -88,7 +108,7 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TimeWiseAPI}/*/*'
 
-  # --- /forecasts (forecasts service) ------------------------------------------
+  # --- /forecasts ---
 
   ForecastsResource:
     Type: AWS::ApiGateway::Resource
@@ -97,6 +117,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'forecasts'
 
+  ForecastsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
+
+  ForecastsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   ForecastsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -104,31 +161,44 @@ Resources:
       ParentId: !Ref ForecastsResource
       PathPart: '{proxy+}'
 
-  ForecastsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref ForecastsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
-
   ForecastsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref ForecastsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
 
-  # --- /sagemaker (forecasts service) --------------------------------------------
+  ForecastsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ForecastsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /sagemaker ---
 
   SageMakerResource:
     Type: AWS::ApiGateway::Resource
@@ -136,6 +206,30 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'sagemaker'
+
+  SageMakerOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref SageMakerResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
 
   SageMakerProxyResource:
     Type: AWS::ApiGateway::Resource
@@ -150,13 +244,38 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref SageMakerProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ForecastsLambdaArn}/invocations'
 
-  # --- /alerts (alerts service) ----------------------------------------------------
+  SageMakerProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref SageMakerProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /alerts ---
 
   AlertsResource:
     Type: AWS::ApiGateway::Resource
@@ -165,6 +284,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'alerts'
 
+  AlertsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
+
+  AlertsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   AlertsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -172,31 +328,44 @@ Resources:
       ParentId: !Ref AlertsResource
       PathPart: '{proxy+}'
 
-  AlertsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref AlertsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
-
   AlertsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref AlertsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
 
-  # --- /inventory-alerts (alerts service) ---------------------------------------------
+  AlertsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AlertsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /inventory-alerts ---
 
   InventoryAlertsResource:
     Type: AWS::ApiGateway::Resource
@@ -205,6 +374,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'inventory-alerts'
 
+  InventoryAlertsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryAlertsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
+
+  InventoryAlertsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryAlertsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   InventoryAlertsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -212,31 +418,44 @@ Resources:
       ParentId: !Ref InventoryAlertsResource
       PathPart: '{proxy+}'
 
-  InventoryAlertsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref InventoryAlertsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
-
   InventoryAlertsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref InventoryAlertsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsLambdaArn}/invocations'
 
-  # --- /kpis (data-platform service) -----------------------------------------------------
+  InventoryAlertsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryAlertsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /kpis ---
 
   KpisResource:
     Type: AWS::ApiGateway::Resource
@@ -251,13 +470,38 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref KpisResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
 
-  # --- /metrics (data-platform service) ---------------------------------------------------
+  KpisOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref KpisResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /metrics ---
 
   MetricsResource:
     Type: AWS::ApiGateway::Resource
@@ -272,13 +516,38 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref MetricsResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
 
-  # --- /data-sources (data-platform service) -----------------------------------------------
+  MetricsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref MetricsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /data-sources ---
 
   DataSourcesResource:
     Type: AWS::ApiGateway::Resource
@@ -287,6 +556,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'data-sources'
 
+  DataSourcesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref DataSourcesResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
+
+  DataSourcesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref DataSourcesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   DataSourcesProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -294,31 +600,44 @@ Resources:
       ParentId: !Ref DataSourcesResource
       PathPart: '{proxy+}'
 
-  DataSourcesMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref DataSourcesResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
-
   DataSourcesProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref DataSourcesProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataPlatformLambdaArn}/invocations'
 
-  # --- /optimization-scenarios (optimization service) ----------------------------------------
+  DataSourcesProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref DataSourcesProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /optimization-scenarios ---
 
   OptimizationScenariosResource:
     Type: AWS::ApiGateway::Resource
@@ -327,6 +646,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'optimization-scenarios'
 
+  OptimizationScenariosMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref OptimizationScenariosResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  OptimizationScenariosOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref OptimizationScenariosResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   OptimizationScenariosProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -334,31 +690,44 @@ Resources:
       ParentId: !Ref OptimizationScenariosResource
       PathPart: '{proxy+}'
 
-  OptimizationScenariosMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref OptimizationScenariosResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
-
   OptimizationScenariosProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref OptimizationScenariosProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
 
-  # --- /inventory-optimizations (optimization service) ---------------------------------------
+  OptimizationScenariosProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref OptimizationScenariosProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /inventory-optimizations ---
 
   InventoryOptimizationsResource:
     Type: AWS::ApiGateway::Resource
@@ -367,6 +736,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'inventory-optimizations'
 
+  InventoryOptimizationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryOptimizationsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
+
+  InventoryOptimizationsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryOptimizationsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   InventoryOptimizationsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -374,31 +780,44 @@ Resources:
       ParentId: !Ref InventoryOptimizationsResource
       PathPart: '{proxy+}'
 
-  InventoryOptimizationsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref InventoryOptimizationsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
-
   InventoryOptimizationsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref InventoryOptimizationsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimizationLambdaArn}/invocations'
 
-  # --- /reports (analytics service) -----------------------------------------------------------
+  InventoryOptimizationsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref InventoryOptimizationsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /reports ---
 
   ReportsResource:
     Type: AWS::ApiGateway::Resource
@@ -407,6 +826,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'reports'
 
+  ReportsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ReportsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
+
+  ReportsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ReportsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   ReportsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -414,31 +870,44 @@ Resources:
       ParentId: !Ref ReportsResource
       PathPart: '{proxy+}'
 
-  ReportsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref ReportsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
-
   ReportsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref ReportsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
 
-  # --- /analytics-insights (analytics service) -------------------------------------------------
+  ReportsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref ReportsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /analytics-insights ---
 
   AnalyticsInsightsResource:
     Type: AWS::ApiGateway::Resource
@@ -453,13 +922,38 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref AnalyticsInsightsResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AnalyticsLambdaArn}/invocations'
 
-  # --- /access-controls (governance service) ---------------------------------------------------
+  AnalyticsInsightsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AnalyticsInsightsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /access-controls ---
 
   AccessControlsResource:
     Type: AWS::ApiGateway::Resource
@@ -468,6 +962,43 @@ Resources:
       ParentId: !GetAtt TimeWiseAPI.RootResourceId
       PathPart: 'access-controls'
 
+  AccessControlsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AccessControlsResource
+      HttpMethod: ANY
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  AccessControlsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AccessControlsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
   AccessControlsProxyResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -475,31 +1006,44 @@ Resources:
       ParentId: !Ref AccessControlsResource
       PathPart: '{proxy+}'
 
-  AccessControlsMethod:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref TimeWiseAPI
-      ResourceId: !Ref AccessControlsResource
-      HttpMethod: ANY
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
-
   AccessControlsProxyMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref AccessControlsProxyResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
 
-  # --- /governance-metrics (governance service) -------------------------------------------------
+  AccessControlsProxyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref AccessControlsProxyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /governance-metrics ---
 
   GovernanceMetricsResource:
     Type: AWS::ApiGateway::Resource
@@ -514,13 +1058,38 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref GovernanceMetricsResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
 
-  # --- /bias-detections (governance service) -----------------------------------------------------
+  GovernanceMetricsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref GovernanceMetricsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # --- /bias-detections ---
 
   BiasDetectionsResource:
     Type: AWS::ApiGateway::Resource
@@ -535,11 +1104,36 @@ Resources:
       RestApiId: !Ref TimeWiseAPI
       ResourceId: !Ref BiasDetectionsResource
       HttpMethod: ANY
-      AuthorizationType: NONE
+      AuthorizationType: !If [HasUserPool, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [HasUserPool, !Ref CognitoAuthorizer, !Ref 'AWS::NoValue']
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GovernanceLambdaArn}/invocations'
+
+  BiasDetectionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TimeWiseAPI
+      ResourceId: !Ref BiasDetectionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE  # CORS preflights carry no Authorization header
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 204
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 204
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
 
   # --- Deployment & stage --------------------------------------------------------
 
@@ -549,27 +1143,50 @@ Resources:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - ForecastsMethod
+      - ForecastsOptionsMethod
       - ForecastsProxyMethod
+      - ForecastsProxyOptionsMethod
+      - SageMakerOptionsMethod
       - SageMakerProxyMethod
+      - SageMakerProxyOptionsMethod
       - AlertsMethod
+      - AlertsOptionsMethod
       - AlertsProxyMethod
+      - AlertsProxyOptionsMethod
       - InventoryAlertsMethod
+      - InventoryAlertsOptionsMethod
       - InventoryAlertsProxyMethod
+      - InventoryAlertsProxyOptionsMethod
       - KpisMethod
+      - KpisOptionsMethod
       - MetricsMethod
+      - MetricsOptionsMethod
       - DataSourcesMethod
+      - DataSourcesOptionsMethod
       - DataSourcesProxyMethod
+      - DataSourcesProxyOptionsMethod
       - OptimizationScenariosMethod
+      - OptimizationScenariosOptionsMethod
       - OptimizationScenariosProxyMethod
+      - OptimizationScenariosProxyOptionsMethod
       - InventoryOptimizationsMethod
+      - InventoryOptimizationsOptionsMethod
       - InventoryOptimizationsProxyMethod
+      - InventoryOptimizationsProxyOptionsMethod
       - ReportsMethod
+      - ReportsOptionsMethod
       - ReportsProxyMethod
+      - ReportsProxyOptionsMethod
       - AnalyticsInsightsMethod
+      - AnalyticsInsightsOptionsMethod
       - AccessControlsMethod
+      - AccessControlsOptionsMethod
       - AccessControlsProxyMethod
+      - AccessControlsProxyOptionsMethod
       - GovernanceMetricsMethod
+      - GovernanceMetricsOptionsMethod
       - BiasDetectionsMethod
+      - BiasDetectionsOptionsMethod
     Properties:
       RestApiId: !Ref TimeWiseAPI
 

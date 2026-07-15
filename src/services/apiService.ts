@@ -1,4 +1,5 @@
 import { API_ENDPOINTS, isApiConfigured } from '../config/aws';
+import { authService } from './authService';
 import type {
   AccessControl,
   Alert,
@@ -49,7 +50,7 @@ class ApiService {
       ...(options.headers as Record<string, string>),
     };
 
-    const token = localStorage.getItem('authToken');
+    const token = await authService.getIdToken();
     if (token) {
       headers.Authorization = `Bearer ${token}`;
     }

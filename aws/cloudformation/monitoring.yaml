@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Observability as code for the TimeWise platform: CloudWatch alarms on Lambda
+  errors, dead-letter queue depth, and API Gateway availability/latency, plus
+  an operations dashboard. Alarm state changes are consumed twice — humans via
+  the SNS topic, and the alerts service via its EventBridge rule.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+  CriticalAlertsTopicArn:
+    Type: String
+    Description: 'SNS topic that receives alarm notifications (output of the lambda stack)'
+
+Resources:
+  # --- Lambda service error alarms ---------------------------------------------
+
+  ForecastsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-critical-forecasts-errors-${Environment}'
+      AlarmDescription: 'Forecasts service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-forecasts-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+      OKActions: [!Ref CriticalAlertsTopicArn]
+
+  AlertsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-critical-alerts-errors-${Environment}'
+      AlarmDescription: 'Alerts service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-alerts-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+      OKActions: [!Ref CriticalAlertsTopicArn]
+
+  DataPlatformErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-data-platform-errors-${Environment}'
+      AlarmDescription: 'Data-platform service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-data-platform-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  OptimizationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-optimization-errors-${Environment}'
+      AlarmDescription: 'Optimization service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-optimization-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  AnalyticsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-analytics-errors-${Environment}'
+      AlarmDescription: 'Analytics service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-analytics-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  GovernanceErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-critical-governance-errors-${Environment}'
+      AlarmDescription: 'Governance (security-relevant) service reported invocation errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub 'timewise-governance-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  # --- Platform health alarms ------------------------------------------------------
+
+  DeadLetterQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-critical-dlq-depth-${Environment}'
+      AlarmDescription: 'Failed async invocations are accumulating in the dead-letter queue'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub 'timewise-lambda-dlq-${Environment}'
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-critical-api-5xx-${Environment}'
+      AlarmDescription: 'API Gateway is returning server errors'
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'timewise-api-${Environment}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  ApiLatencyP99Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'timewise-api-latency-p99-${Environment}'
+      AlarmDescription: 'API p99 latency is degraded'
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'timewise-api-${Environment}'
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 3000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref CriticalAlertsTopicArn]
+
+  # --- Operations dashboard -----------------------------------------------------------
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'TimeWise-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API traffic",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "timewise-api-${Environment}"],
+                  [".", "4XXError", ".", "."],
+                  [".", "5XXError", ".", "."]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API latency (p50 / p99)",
+                "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "timewise-api-${Environment}", {"stat": "p50"}],
+                  ["...", {"stat": "p99"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda errors by service",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "timewise-forecasts-${Environment}"],
+                  ["...", "timewise-alerts-${Environment}"],
+                  ["...", "timewise-data-platform-${Environment}"],
+                  ["...", "timewise-optimization-${Environment}"],
+                  ["...", "timewise-analytics-${Environment}"],
+                  ["...", "timewise-governance-${Environment}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda duration (avg) & DLQ depth",
+                "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "timewise-forecasts-${Environment}", {"stat": "Average"}],
+                  ["...", "timewise-alerts-${Environment}", {"stat": "Average"}],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "timewise-lambda-dlq-${Environment}", {"stat": "Maximum", "yAxis": "right"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 24, "height": 6,
+              "properties": {
+                "title": "Business metrics",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 3600,
+                "metrics": [
+                  ["TimeWise/ML", "ForecastGenerated"],
+                  ["TimeWise/ML", "DirectInference"],
+                  ["TimeWise/Alerts", "AlertsCreated"],
+                  ["TimeWise/Operations", "OptimizationRunStarted"],
+                  ["TimeWise/Operations", "ReportGenerated"],
+                  ["TimeWise/Governance", "AccessControlChanged"]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Value: !Ref OperationsDashboard

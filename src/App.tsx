@@ -10,9 +10,12 @@ import {
   Brain,
   Database,
   Shield,
-  Truck
+  Truck,
+  LogOut
 } from 'lucide-react';
 
+import { LoginPage } from './components/LoginPage';
+import { authService } from './services/authService';
 import { DataIngestionPanel } from './components/DataIngestionPanel';
 import { LogisticsOptimization } from './components/LogisticsOptimization';
 import { MonitoringAlerts } from './components/MonitoringAlerts';
@@ -26,6 +29,10 @@ import { useForecasts, useInventoryAlerts, useKPIs } from './hooks/useApiData';
 
 function App() {
   const [activeTab, setActiveTab] = useState('overview');
+  // When Cognito is unconfigured the dashboard runs in demo mode without a login gate.
+  const [authenticated, setAuthenticated] = useState(
+    () => !authService.isConfigured() || authService.isAuthenticated()
+  );
 
   // Fetch dynamic data from AWS services
   const { 
@@ -130,6 +137,15 @@ function App() {
 
   const unacknowledgedCount = displayInventoryAlerts.filter(alert => alert.severity === 'critical').length;
 
+  if (!authenticated) {
+    return <LoginPage onSignedIn={() => setAuthenticated(true)} />;
+  }
+
+  const handleSignOut = async () => {
+    await authService.signOut();
+    setAuthenticated(false);
+  };
+
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
@@ -167,6 +183,15 @@ function App() {
                 <button className="p-2 text-slate-600 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors">
                   <Settings className="w-5 h-5" />
                 </button>
+                {authService.isConfigured() && (
+                  <button
+                    onClick={handleSignOut}
+                    title={`Sign out ${authService.currentUser() ?? ''}`}
+                    className="p-2 text-slate-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                  >
+                    <LogOut className="w-5 h-5" />
+                  </button>
+                )}
               </div>
             </div>
           </div>

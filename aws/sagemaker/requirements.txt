@@ -1,0 +1,5 @@
+# Tooling for deploying the TimeLLM endpoint (deploy.py).
+# inference.py itself runs inside the SageMaker PyTorch serving container,
+# which already provides torch.
+sagemaker>=2.200
+boto3>=1.34

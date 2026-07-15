@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  S3 + Glue data lake for the TimeWise platform: encrypted raw/curated buckets,
+  a Glue database and crawler over the curated zone, and the PySpark ETL job
+  (aws/glue/etl_sales_data.py) that standardizes raw sales drops into
+  partitioned Parquet for TimeLLM training and analytics.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+  GlueScriptsBucket:
+    Type: String
+    Description: 'Bucket holding the Glue job script (upload aws/glue/etl_sales_data.py)'
+  GlueScriptsPrefix:
+    Type: String
+    Default: 'glue/'
+  EtlScheduleCron:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'  # daily at 02:00 UTC
+    Description: 'Schedule for the sales ETL job'
+
+Resources:
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'timewise-raw-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-raw-to-ia
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  CuratedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'timewise-curated-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Application, Value: TimeWise}
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'timewise_${Environment}'
+        Description: 'Curated TimeWise supply-chain datasets'
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'timewise-glue-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: data-lake-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${GlueScriptsBucket}'
+                  - !Sub 'arn:aws:s3:::${GlueScriptsBucket}/${GlueScriptsPrefix}*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt CuratedDataBucket.Arn
+                  - !Sub '${CuratedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringLike: {'cloudwatch:namespace': 'TimeWise/*'}
+
+  SalesEtlJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub 'timewise-sales-etl-${Environment}'
+      Description: 'Standardize raw sales drops into partitioned Parquet'
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 60
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptsBucket}/${GlueScriptsPrefix}etl_sales_data.py'
+      DefaultArguments:
+        '--job-language': 'python'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--raw_bucket': !Ref RawDataBucket
+        '--curated_bucket': !Ref CuratedDataBucket
+        '--environment': !Ref Environment
+
+  SalesEtlTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub 'timewise-sales-etl-schedule-${Environment}'
+      Type: SCHEDULED
+      Schedule: !Ref EtlScheduleCron
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref SalesEtlJob
+
+  CuratedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub 'timewise-curated-crawler-${Environment}'
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${CuratedDataBucket}/sales/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Schedule:
+        ScheduleExpression: 'cron(30 3 * * ? *)'  # after the nightly ETL
+
+Outputs:
+  RawDataBucketName:
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawBucket'
+  CuratedDataBucketName:
+    Value: !Ref CuratedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CuratedBucket'
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase

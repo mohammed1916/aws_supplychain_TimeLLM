@@ -122,11 +122,11 @@ def update_user_access(event: Dict[str, Any], user_id: str) -> Dict[str, Any]:
         raise
 
     # Structured audit record; retained with the function's CloudWatch log group.
-    actor = (
-        event.get("requestContext", {})
-        .get("authorizer", {})
-        .get("principalId", "anonymous")
-    )
+    # With the Cognito authorizer enabled, API Gateway injects verified JWT
+    # claims into the request context; fall back to "anonymous" in unsecured
+    # dev deployments.
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+    actor = claims.get("email") or claims.get("sub") or "anonymous"
     logger.info(
         json.dumps(
             {

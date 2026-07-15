@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Cognito user pool for the TimeWise Supply Chain platform. Users sign in with
+  email + password (USER_PASSWORD_AUTH); the pool ARN feeds the API Gateway
+  Cognito authorizer and the pool/client IDs feed the frontend.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'prod'
+    AllowedValues: ['dev', 'staging', 'prod']
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'timewise-users-${Environment}'
+      # Operators create accounts; there is no self-service sign-up surface.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+        - Name: department
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      UserPoolTags:
+        Environment: !Ref Environment
+        Application: TimeWise
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'timewise-dashboard-${Environment}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false  # public SPA client; secrets cannot be kept in a browser
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      EnableTokenRevocation: true
+
+Outputs:
+  UserPoolId:
+    Description: 'Set as VITE_COGNITO_USER_POOL_ID'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+  UserPoolArn:
+    Description: 'Pass as UserPoolArn to the API Gateway stack'
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolArn'
+  UserPoolClientId:
+    Description: 'Set as VITE_COGNITO_CLIENT_ID'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
