@@ -245,6 +245,197 @@ CloudWatch alarms route back into the alerts Lambda, which classifies each alarm
 - [ ] Multi-region deployment
 - [ ] Real-time streaming analytics (Kinesis)
 
+---
+
+## Appendix: Implementation Inventory
+
+Every quantified claim in this README is traceable to a specific file and line in this repository. This appendix documents the full inventory. Counts can be reproduced with the commands shown in [Reproducing These Counts](#reproducing-these-counts).
+
+### A. Infrastructure as Code
+
+#### A.1 `aws/cloudformation/dynamodb-tables.yaml` — 7 tables, 5 GSIs
+
+One parameterized stack (`Environment`: `dev` | `staging` | `prod`). All 7 tables declare `BillingMode: PAY_PER_REQUEST` and `PointInTimeRecoveryEnabled: true`. Each table name is exported as a CloudFormation output for cross-stack reference (lines 223–264).
+
+| # | Logical Resource | Table Name | Partition / Sort Key | GSI | TTL | Defined At |
+|---|---|---|---|---|---|---|
+| 1 | `ForecastsTable` | `timewise-forecasts-${Environment}` | `forecastId` | `ProductIndex` (`productId`, `createdAt`) | — | [dynamodb-tables.yaml:13](aws/cloudformation/dynamodb-tables.yaml#L13) |
+| 2 | `InventoryAlertsTable` | `timewise-inventory-alerts-${Environment}` | `alertId` | `ProductSeverityIndex` (`productId`, `severity`) | — | [dynamodb-tables.yaml:46](aws/cloudformation/dynamodb-tables.yaml#L46) |
+| 3 | `KPIsTable` | `timewise-kpis-${Environment}` | `kpiId` / `timestamp` | — | `ttl` attribute | [dynamodb-tables.yaml:79](aws/cloudformation/dynamodb-tables.yaml#L79) |
+| 4 | `DataSourcesTable` | `timewise-data-sources-${Environment}` | `sourceId` | `TypeIndex` (`sourceType`) | — | [dynamodb-tables.yaml:106](aws/cloudformation/dynamodb-tables.yaml#L106) |
+| 5 | `AlertsTable` | `timewise-alerts-${Environment}` | `alertId` | `CategoryTimeIndex` (`category`, `timestamp`) | — | [dynamodb-tables.yaml:135](aws/cloudformation/dynamodb-tables.yaml#L135) |
+| 6 | `MetricsTable` | `timewise-metrics-${Environment}` | `metricId` / `timestamp` | — | `ttl` attribute | [dynamodb-tables.yaml:168](aws/cloudformation/dynamodb-tables.yaml#L168) |
+| 7 | `AccessControlsTable` | `timewise-access-controls-${Environment}` | `userId` | `RoleIndex` (`role`) | — | [dynamodb-tables.yaml:195](aws/cloudformation/dynamodb-tables.yaml#L195) |
+
+All GSIs use `ProjectionType: ALL`. The two time-series tables (KPIs, Metrics) use composite keys plus TTL-based expiry; the other five are keyed on a single ID with query patterns served by their GSIs.
+
+#### A.2 `aws/cloudformation/api-gateway.yaml` — REST API stack
+
+One parameterized stack taking `Environment`, `ForecastsLambdaArn`, and `AlertsLambdaArn` as inputs. Resources declared:
+
+| Resource | Type | Purpose | Defined At |
+|---|---|---|---|
+| `TimeWiseAPI` | `AWS::ApiGateway::RestApi` | Regional REST API | [api-gateway.yaml:21](aws/cloudformation/api-gateway.yaml#L21) |
+| `APIDeployment` | `AWS::ApiGateway::Deployment` | Stage deployment named after `Environment` | [api-gateway.yaml:38](aws/cloudformation/api-gateway.yaml#L38) |
+| `ForecastsLambdaPermission` / `AlertsLambdaPermission` | `AWS::Lambda::Permission` | Allow API Gateway to invoke each Lambda | [api-gateway.yaml:48](aws/cloudformation/api-gateway.yaml#L48), [:56](aws/cloudformation/api-gateway.yaml#L56) |
+| `ForecastsResource` + `ForecastsMethod` | Resource + `ANY` method | `/forecasts` via `AWS_PROXY` integration | [api-gateway.yaml:65](aws/cloudformation/api-gateway.yaml#L65) |
+| `AlertsResource` + `AlertsMethod` | Resource + `ANY` method | `/alerts` via `AWS_PROXY` integration | [api-gateway.yaml:91](aws/cloudformation/api-gateway.yaml#L91) |
+| `ForecastsOptionsMethod` / `AlertsOptionsMethod` | `OPTIONS` methods | CORS preflight via `MOCK` integration | [api-gateway.yaml:117](aws/cloudformation/api-gateway.yaml#L117), [:142](aws/cloudformation/api-gateway.yaml#L142) |
+
+The stack outputs `APIGatewayURL` and `APIGatewayId` ([api-gateway.yaml:166-177](aws/cloudformation/api-gateway.yaml#L166-L177)). HTTP-method routing (`GET`/`POST`/`PUT`) is performed inside each Lambda handler, which is why the methods are declared as `ANY`.
+
+### B. Lambda Handlers
+
+#### B.1 `aws/lambda/forecasts-handler.py` (208 lines)
+
+AWS SDK clients initialized at [forecasts-handler.py:13-15](aws/lambda/forecasts-handler.py#L13-L15): DynamoDB (resource), SageMaker Runtime, CloudWatch.
+
+| Route | Function | Behavior | Defined At |
+|---|---|---|---|
+| `GET /forecasts` | `get_forecasts` | Scans the forecasts table, optional `productId` filter, converts `Decimal` for JSON, emits `ForecastsRetrieved` metric | [forecasts-handler.py:54](aws/lambda/forecasts-handler.py#L54) |
+| `POST /forecasts` | `create_forecast` | Invokes the SageMaker TimeLLM endpoint, persists the prediction, emits `ForecastGenerated` + `ForecastAccuracy` metrics | [forecasts-handler.py:99](aws/lambda/forecasts-handler.py#L99) |
+| `PUT /forecasts/{id}` | `update_forecast` | Updates forecast status via `update_item` with `ALL_NEW` return | [forecasts-handler.py:163](aws/lambda/forecasts-handler.py#L163) |
+
+SageMaker inference contract ([forecasts-handler.py:103-115](aws/lambda/forecasts-handler.py#L103-L115)) — request fields: `historical_data`, `forecast_horizon` (default 6), `product_id`, `external_factors`; response fields consumed: `predictions`, `confidence`, `modelVersion`, `accuracy`. The persisted DynamoDB item ([forecasts-handler.py:121-129](aws/lambda/forecasts-handler.py#L121-L129)) stores all of these plus a timestamped `forecastId` and `createdAt`.
+
+#### B.2 `aws/lambda/alerts-handler.py` (250 lines)
+
+AWS SDK clients initialized at [alerts-handler.py:13-15](aws/lambda/alerts-handler.py#L13-L15): DynamoDB (resource), CloudWatch, SNS. This handler is **dual-trigger**: the entry point inspects `event.source` and branches between CloudWatch alarm events and API Gateway HTTP requests ([alerts-handler.py:26-43](aws/lambda/alerts-handler.py#L26-L43)).
+
+| Trigger | Function | Behavior | Defined At |
+|---|---|---|---|
+| CloudWatch alarm (`source == 'aws.cloudwatch'`) | `handle_cloudwatch_alarm` | Converts an `ALARM`-state event into an alert record; severity `critical` if the alarm name contains "critical", else `warning`; publishes critical alerts to SNS | [alerts-handler.py:59](aws/lambda/alerts-handler.py#L59) |
+| `GET /alerts` | `get_alerts` | Scans, sorts newest-first, returns `count` and `unacknowledged` totals | [alerts-handler.py:93](aws/lambda/alerts-handler.py#L93) |
+| `POST /alerts` | `create_alert` | Writes an alert item and emits the dimensioned `AlertsCreated` metric | [alerts-handler.py:119](aws/lambda/alerts-handler.py#L119) |
+| `POST /alerts/{id}/acknowledge` | `acknowledge_alert` | Sets `acknowledged = true` with `acknowledgedAt` timestamp | [alerts-handler.py:172](aws/lambda/alerts-handler.py#L172) |
+
+Alarm auto-classification (`determine_category`, [alerts-handler.py:198-210](aws/lambda/alerts-handler.py#L198-L210)) — 5 categories by keyword match on the alarm name:
+
+| Category | Trigger Keywords |
+|---|---|
+| `inventory` | "inventory", "stock" |
+| `demand` | "demand", "forecast" |
+| `supply` | "supply", "supplier" |
+| `security` | "security", "access" |
+| `system` | (default) |
+
+SNS publication for critical alerts: `send_sns_notification` at [alerts-handler.py:212](aws/lambda/alerts-handler.py#L212).
+
+### C. API Surface — 14 Endpoints
+
+All endpoint URLs are centralized in `API_ENDPOINTS` ([src/config/aws.ts:32-47](src/config/aws.ts#L32-L47)) and consumed by the typed client `ApiService` ([src/services/apiService.ts](src/services/apiService.ts)), which declares 22 async methods (21 effective — see [Known Issues](#e-known-issues)) sharing a single `fetchWithAuth` wrapper that injects the bearer token and normalizes errors.
+
+| # | Endpoint | Client Methods | Backend Status |
+|---|---|---|---|
+| 1 | `/forecasts` | `getForecasts`, `updateForecast` | **Deployed** (forecasts Lambda) |
+| 2 | `/alerts` | `getAlerts`, `acknowledgeAlert` | **Deployed** (alerts Lambda) |
+| 3 | `/inventory-alerts` | `getInventoryAlerts`, `acknowledgeAlert` | Client-defined; static fallback |
+| 4 | `/kpis` | `getKPIs` | Client-defined; static fallback |
+| 5 | `/data-sources` | `getDataSources`, `updateDataSource` | Client-defined; static fallback |
+| 6 | `/optimization-scenarios` | `getOptimizationScenarios`, `runOptimization` | Client-defined; static fallback |
+| 7 | `/inventory-optimizations` | `getInventoryOptimizations`, `applyOptimization` | Client-defined; static fallback |
+| 8 | `/metrics` | `getMetrics` | Client-defined; static fallback |
+| 9 | `/reports` | `getReports`, `generateReport` | Client-defined; static fallback |
+| 10 | `/analytics-insights` | `getAnalyticsInsights` | Client-defined; static fallback |
+| 11 | `/access-controls` | `getAccessControls`, `updateUserAccess` | Client-defined; static fallback |
+| 12 | `/governance-metrics` | `getGovernanceMetrics` | Client-defined; static fallback |
+| 13 | `/bias-detections` | `getBiasDetections` | Client-defined; static fallback |
+| 14 | `/sagemaker/inference` | `runSageMakerInference` | Client-defined; static fallback |
+
+### D. Frontend Inventory
+
+#### D.1 Dashboard modules — 6 tabs
+
+Tab registry at [src/App.tsx:192-199](src/App.tsx#L192-L199): Overview, Data Pipeline, Optimization, Monitoring, Analytics, Responsible AI.
+
+| Component | Lines | Renders |
+|---|---|---|
+| `App.tsx` (Overview tab inline) | 399 | KPI cards, AWS service status grid, forecast chart, critical alerts panel |
+| `DataIngestionPanel.tsx` | 290 | Data source status (S3 / Kinesis / RDS / API types), quality scores, ETL pipeline view |
+| `LogisticsOptimization.tsx` | 298 | Optimization scenarios and inventory recommendations |
+| `MonitoringAlerts.tsx` | 371 | Alert feed, system health, acknowledgment actions |
+| `ReportingAnalytics.tsx` | 365 | AI insights, report generation, executive views |
+| `ResponsibleAI.tsx` | 523 | RBAC access controls, AI governance metrics, bias detection tracking |
+| `DataStatus.tsx` / `ErrorBoundary.tsx` / `LoadingSpinner.tsx` | 54 / 67 / 26 | Shared utilities: freshness indicator, crash isolation, loading states |
+
+#### D.2 Data-fetching hooks — 1 generic + 13 domain hooks
+
+The generic `useApiData<T>` hook ([src/hooks/useApiData.ts:9-58](src/hooks/useApiData.ts#L9-L58)) provides loading/error/`lastUpdated` state, a manual `refresh()`, and interval-based auto-refresh (default 30 s). Thirteen domain hooks wrap it with per-domain polling cadences ([src/hooks/useApiData.ts:61-111](src/hooks/useApiData.ts#L61-L111)):
+
+| Hook | Interval | Hook | Interval |
+|---|---|---|---|
+| `useAlerts` | 5 s | `useInventoryOptimizations` | 60 s |
+| `useInventoryAlerts` | 10 s | `useAccessControls` | 60 s |
+| `useMetrics` | 10 s | `useBiasDetections` | 60 s |
+| `useDataSources` | 15 s | `useOptimizationScenarios` | 120 s |
+| `useKPIs` | 30 s | `useAnalyticsInsights` | 180 s |
+| `useGovernanceMetrics` | 30 s | `useReports` | 300 s |
+| `useForecasts` | 60 s | | |
+
+If an API call fails, components fall back to static default data (e.g., [src/App.tsx:56-83](src/App.tsx#L56-L83)) so the dashboard degrades gracefully instead of blanking.
+
+#### D.3 Frontend note on displayed figures
+
+The KPI values shown in the UI when no backend is connected (forecast accuracy, cost savings, records processed, etc.) are **static fallback demo data**, defined at [src/App.tsx:57-78](src/App.tsx#L57-L78) and in each component's `default*` constants. They are placeholders for layout and demo purposes, not measured results.
+
+### E. Observability — 4 Custom Metrics, 3 Namespaces
+
+Three `put_metric_data` call sites emit four distinct metrics:
+
+| Namespace | Metric | Unit | Dimensions | Emitted By |
+|---|---|---|---|---|
+| `TimeWise/API` | `ForecastsRetrieved` | Count | — | [forecasts-handler.py:73-83](aws/lambda/forecasts-handler.py#L73-L83) |
+| `TimeWise/ML` | `ForecastGenerated` | Count | — | [forecasts-handler.py:134-148](aws/lambda/forecasts-handler.py#L134-L148) |
+| `TimeWise/ML` | `ForecastAccuracy` | Percent | — | [forecasts-handler.py:134-148](aws/lambda/forecasts-handler.py#L134-L148) |
+| `TimeWise/Alerts` | `AlertsCreated` | Count | `AlertType`, `Category` | [alerts-handler.py:138-157](aws/lambda/alerts-handler.py#L138-L157) |
+
+The `AlertsCreated` dimensions enable per-severity and per-category CloudWatch dashboards and alarms. Note that in CloudWatch billing terms, each unique dimension combination counts as a separate custom metric.
+
+### F. Known Issues
+
+- `ApiService.acknowledgeAlert` is declared twice ([src/services/apiService.ts:42](src/services/apiService.ts#L42) targeting `/inventory-alerts`, [src/services/apiService.ts:92](src/services/apiService.ts#L92) targeting `/alerts`); the second declaration silently overrides the first, so inventory-alert acknowledgment currently hits the wrong endpoint.
+- `get_forecasts` and `get_alerts` use DynamoDB `Scan`; at production scale these should be `Query` operations against the provisioned GSIs.
+- The SNS topic ARN in `send_sns_notification` ([alerts-handler.py:215](aws/lambda/alerts-handler.py#L215)) is a hardcoded placeholder and must be replaced at deployment.
+- No automated test suite exists yet (see Roadmap).
+
+### G. Codebase Statistics
+
+3,606 lines across TypeScript/TSX, Python, and CloudFormation YAML:
+
+| Area | Files | Lines |
+|---|---|---|
+| Frontend components (`src/*.tsx`, `src/components/`) | 9 | 2,180 |
+| Frontend config / hooks / services (`src/config`, `src/hooks`, `src/services`) | 3 | 305 |
+| Lambda handlers (`aws/lambda/`) | 2 | 458 |
+| CloudFormation templates (`aws/cloudformation/`) | 2 | 439 |
+| Other (`main.tsx`, type declarations) | 2 | 11 |
+
+### Reproducing These Counts
+
+```bash
+# 7 DynamoDB tables, 5 GSIs, 7 PITR blocks, 2 TTL blocks
+grep -c "AWS::DynamoDB::Table"           aws/cloudformation/dynamodb-tables.yaml
+grep -c "IndexName:"                     aws/cloudformation/dynamodb-tables.yaml
+grep -c "PointInTimeRecoverySpecification" aws/cloudformation/dynamodb-tables.yaml
+grep -c "TimeToLiveSpecification"        aws/cloudformation/dynamodb-tables.yaml
+
+# 14 API endpoints, 22 declared client methods, 14 exported hooks (1 generic + 13 domain)
+grep -c "AWS_CONFIG.apiGateway.baseUrl"  src/config/aws.ts
+grep -c "^  async "                      src/services/apiService.ts
+grep -c "^export function use"           src/hooks/useApiData.ts
+
+# 4 custom CloudWatch metrics across 3 namespaces
+grep -h "MetricName" aws/lambda/*.py | sort -u
+grep -h "Namespace=" aws/lambda/*.py | sort -u
+
+# 5 alert categories, 6 dashboard tabs
+grep -n "return '" aws/lambda/alerts-handler.py
+grep -n "{ id: '"  src/App.tsx
+
+# Total lines of code
+find src aws -name "*.ts" -o -name "*.tsx" -o -name "*.py" -o -name "*.yaml" | xargs wc -l
+```
+
 ## License
 
 MIT
